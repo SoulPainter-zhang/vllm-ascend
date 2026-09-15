@@ -18,6 +18,7 @@ import time
 import numpy as np
 import torch
 from vllm.logger import logger
+from vllm.v1.lwd_debug import LwdDebug
 
 from vllm_ascend import envs
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
@@ -141,7 +142,16 @@ class LwdCloudModelRunner(NPUModelRunner):
         with stream-ordered H2D copies, so no host sync is needed there
         either.  The base fill loop may have copied stale buffer content
         earlier; our device write happens after it and is authoritative.
-        """
+
+        Chunks stamped ``has_mrope`` carry a second frame of mrope
+        positions ``[n, 3]`` (int64): the rows are written into the
+        request's ``req_state.mrope_positions`` window (overwriting the
+        pure-text passthrough initialization) so the native
+        ``_calc_mrope_positions`` consumes wire positions unchanged;
+        when the last chunk lands, ``mrope_position_delta`` is derived
+        locally (max+1-N) for the decode phase.  The aux frame rides
+        the same two-segment UP path (endpoint P2P + TP-group broadcast
+        at consume time, each its own launch+wait atomic pair)."""
         worker = self.worker
         if worker is None:
             return
@@ -184,11 +194,15 @@ class LwdCloudModelRunner(NPUModelRunner):
                 up_flat = res.tensor
                 if up_flat is None:
                     continue
+                # aux 帧(mrope positions [n,3] int64)与主帧同一逻辑
+                # 请求:端点从 future 结果直接取第二载荷。
+                aux_flat = res.aux_tensor
             else:
                 # 非端点:现场分配接收 buffer,等端点广播转发。
                 up_flat = torch.empty(
                     numel, dtype=torch.bfloat16, device="npu"
                 )
+                aux_flat = None
             from vllm.distributed.parallel_state import get_tp_group
             _tp = get_tp_group()
             if _tp.world_size > 1:
@@ -201,6 +215,25 @@ class LwdCloudModelRunner(NPUModelRunner):
                     async_op=True,
                 )
                 work.wait()  # 桥接广播完成到当前(计算)流,后续 copy 有序
+            mrope_flat = None
+            if meta.has_mrope:
+                # aux 帧的第二段广播:独立 launch+wait 原子对(与主广播
+                # 同计算流背靠背,不共用句柄)——保持两段式 UP 的交付
+                # 纪律;非端点现场分配精确尺寸 int64 缓冲。
+                if not _is_endpoint:
+                    aux_flat = torch.empty(
+                        sum(len(t) for t in meta.token_ids) * 3,
+                        dtype=torch.int64, device="npu",
+                    )
+                if _tp.world_size > 1:
+                    work_aux = dist.broadcast(
+                        aux_flat,
+                        src=_tp.ranks[0],
+                        group=_tp.device_group,
+                        async_op=True,
+                    )
+                    work_aux.wait()
+                mrope_flat = aux_flat.view(-1, 3)
             logger.info(
                 "[Lwd][perf] cloud up-recv-wait seqno=%s dur=%.2fms",
                 batch_seqno, (time.monotonic() - _t_wait) * 1000,
@@ -208,8 +241,9 @@ class LwdCloudModelRunner(NPUModelRunner):
             embeds = up_flat.view(-1, hidden_size)
             logger.info(
                 "[Lwd][cloud-runner] UP embeds consumed seqno=%s rows=%s "
-                "reqs=%s",
+                "reqs=%s has_mrope=%s",
                 batch_seqno, embeds.shape[0], meta.req_ids,
+                mrope_flat is not None,
             )
             row = 0
             for req_id, token_ids in zip(meta.req_ids, meta.token_ids):
@@ -256,6 +290,14 @@ class LwdCloudModelRunner(NPUModelRunner):
                             embeds[row : row + n], non_blocking=True
                         )
                     self.input_batch.is_token_ids[idx, start : start + n] = False
+                    # mrope 行与 embeds 行严格同窗同 row(边侧同批切片):
+                    # 写 req_state 窗口,末 chunk 落地自推 delta。
+                    if mrope_flat is not None:
+                        self._lwd_inject_mrope_positions(
+                            req_id, start, n,
+                            mrope_flat[row : row + n], prompt_len,
+                        )
+                    LwdDebug.cloud_embeds_injected(req_id, idx, start, n, buf)  # [lwd-debug]
                 row += n
             # 跨流生命周期登记:端点 recv buffer 由通道流分配与复用
             # (同尺寸 chunk 下分配器几乎总给同一块),本步 copy 在计算流。
@@ -263,11 +305,50 @@ class LwdCloudModelRunner(NPUModelRunner):
             # 下一 seqno 的 irecv 覆写——深异步队列下表现为跨 seqno 串
             # 数据(多请求乱码)。登记后复用即被正确排序。
             up_flat.record_stream(torch.npu.current_stream())
+            # aux 帧同款竞态防护(端点 recv buffer;非端点本地分配,
+            # 登记无害)。
+            if aux_flat is not None:
+                aux_flat.record_stream(torch.npu.current_stream())
 
     # ------------------------------------------------------------------ #
     # Collect probe (measurement only; output discarded, protocol        #
     # still returns token_ids directly)                                   #
     # ------------------------------------------------------------------ #
+
+    def _lwd_inject_mrope_positions(
+        self,
+        req_id: str,
+        start: int,
+        n: int,
+        chunk_positions: torch.Tensor,
+        prompt_len: int,
+    ) -> None:
+        """写入一个 chunk 的线 mrope positions([n,3] int64,NPU)到请求
+        缓存的 [3, prompt] 窗口;末 chunk 落地时自推 delta(=
+        positions.max()+1-prompt_len,与边侧逐值一致)供 decode 期
+        原生 _calc_mrope_positions 现算 completion 段位置。
+
+        req_state.mrope_positions 由 ids=None 直通初始化(arange 纯文
+        本位置)——多模态请求的窗口被逐 chunk 覆盖,纯文本请求永不走
+        本路径(边侧不给它发 mrope 帧)。"""
+        req_state = self.requests.get(req_id)
+        assert chunk_positions.shape == (n, 3), (
+            f"mrope frame shape {tuple(chunk_positions.shape)} != "
+            f"({n}, 3) (req={req_id})"
+        )
+        req_state.mrope_positions[:, start : start + n] = (
+            chunk_positions.t().cpu()
+        )
+        if start + n >= prompt_len:
+            positions = req_state.mrope_positions[:, :prompt_len]
+            req_state.mrope_position_delta = (
+                int(positions.max().item()) + 1 - prompt_len
+            )
+            logger.info(
+                "[Lwd][cloud-runner] mrope complete: req=%s prompt=%d "
+                "delta=%d",
+                req_id, prompt_len, req_state.mrope_position_delta,
+            )
 
     def _sample(self, logits, spec_decode_metadata):
         """Capture the sampler output for the collect probe

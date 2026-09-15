@@ -38,11 +38,13 @@ class LwdCommFuture:
         done_event: torch.npu.Event | None,
         tensor: torch.Tensor | None = None,
         keepalive: Any = None,
+        aux_tensor: torch.Tensor | None = None,
     ) -> None:
         self._request = request
         self._handles = handles
         self._done_event = done_event
         self._tensor = tensor
+        self._aux_tensor = aux_tensor
         self._keepalive = keepalive
         self._status = LwdCommStatus.PENDING
         self._error: BaseException | None = None
@@ -67,11 +69,13 @@ class LwdCommFuture:
         done_event: "torch.npu.Event | None",
         tensor: torch.Tensor | None = None,
         keepalive: Any = None,
+        aux_tensor: torch.Tensor | None = None,
     ) -> None:
         with self._done_cond:
             self._handles = handles
             self._done_event = done_event
             self._tensor = tensor
+            self._aux_tensor = aux_tensor
             self._keepalive = keepalive
             self._done_cond.notify_all()
 
@@ -143,17 +147,22 @@ class LwdCommFuture:
                     f"lwd-comm op failed on {self._request.channel.value} "
                     f"seqno={self._request.seqno}"
                 ) from self._error
-        return LwdCommResult(status=self._status, tensor=self._tensor)
+        return LwdCommResult(
+            status=self._status, tensor=self._tensor,
+            aux_tensor=self._aux_tensor,
+        )
 
     def result(self) -> LwdCommResult:
         with self._lock:
-            status, tensor, error = self._status, self._tensor, self._error
+            status, tensor, aux_tensor, error = (
+                self._status, self._tensor, self._aux_tensor, self._error,
+            )
         if status is LwdCommStatus.ERROR:
             raise RuntimeError(
                 f"lwd-comm op failed on {self._request.channel.value} "
                 f"seqno={self._request.seqno}"
             ) from error
-        return LwdCommResult(status=status, tensor=tensor)
+        return LwdCommResult(status=status, tensor=tensor, aux_tensor=aux_tensor)
 
     # ------------------------------------------------------------------ #
     # Device-side ordering for consumers                                  #

@@ -116,7 +116,12 @@ class LwdChannel:
         """Give the comm layer ownership of the send payload."""
         assert request.tensor is not None, "send requires tensor"
         owned = request.tensor.detach().clone()
-        return replace(request, tensor=owned)
+        aux_owned = (
+            request.aux_tensor.detach().clone()
+            if request.aux_tensor is not None
+            else None
+        )
+        return replace(request, tensor=owned, aux_tensor=aux_owned)
 
     # ------------------------------------------------------------------ #
     # Sequenced submission (reorder buffer)                               #
@@ -256,6 +261,7 @@ class LwdChannel:
         """Issue the wire op, bridge it onto the channel stream, record
         the completion event."""
         tensor: torch.Tensor | None = None
+        aux_tensor: torch.Tensor | None = None
         keepalive: Any = None
         stream = self._stream()
         # Capture the producer stream BEFORE entering the channel-stream
@@ -275,9 +281,9 @@ class LwdChannel:
                 # the channel stream after it.
                 stream.wait_stream(producer_stream)
                 handles = self._wire_send(req)
-                keepalive = req.tensor
+                keepalive = (req.tensor, req.aux_tensor)
             else:
-                tensor, handles = self._wire_recv(req)
+                tensor, aux_tensor, handles = self._wire_recv(req)
             done_event = self._bridge_and_record(handles)
         future_request = replace(req, tensor=None) if req.op == "send" else req
         if into is None:
@@ -287,12 +293,14 @@ class LwdChannel:
                 done_event=done_event,
                 tensor=tensor,
                 keepalive=keepalive,
+                aux_tensor=aux_tensor,
             )
         into._bind(
             handles=handles,
             done_event=done_event,
             tensor=tensor,
             keepalive=keepalive,
+            aux_tensor=aux_tensor,
         )
         return into
 
@@ -325,8 +333,22 @@ class LwdChannel:
         # UP(边→云)两层通信:第一段边→云端点 P2P(只等端点 join,
         # 不再被 8 卡 join 拖住);第二段端点在云 TP 组内 broadcast
         # (见 _wire_recv)。DOWN(云 leader→边)保持点对点。
+        # aux 帧(mrope positions)为紧跟主帧的第二条 P2P op——同
+        # seqno 管两帧,skip/drain 语义不变;第二段(云 TP 组内广播)
+        # 由云 runner 在消费时刻对 aux 同样补发(见 lwd_cloud_model_runner)。
         if self.channel_type == LwdChannelType.UP:
-            return [dist.isend(tensor.contiguous(), dst=peer, group=group)]
+            handles = [dist.isend(tensor.contiguous(), dst=peer, group=group)]
+            if req.aux_tensor is not None:
+                handles.append(
+                    dist.isend(
+                        req.aux_tensor.contiguous(), dst=peer, group=group
+                    )
+                )
+            return handles
+        if req.aux_tensor is not None:
+            raise RuntimeError(
+                "aux payload is only supported on the UP channel"
+            )
         return [dist.isend(tensor.contiguous(), dst=peer, group=group)]
 
     def _wire_recv(self, req: LwdCommRequest):
@@ -336,9 +358,10 @@ class LwdChannel:
             peer = lwd_wire.get_lwd_channel_peer(self.channel_type)
         logger.debug(
             "[lwd-comm] RECV post channel=%s my_rank=%d src=%s group_ranks=%s "
-            "num_elements=%d op=%s",
+            "num_elements=%d aux_elements=%d op=%s",
             self.channel_type, dist.get_rank(), peer,
             dist.get_process_group_ranks(group), req.num_elements,
+            req.aux_num_elements,
             "world_broadcast(src=0)" if self.channel_type == LwdChannelType.UP
             else "irecv",
         )
@@ -347,7 +370,24 @@ class LwdChannel:
         buffer = torch.empty(
             req.num_elements, dtype=torch.bfloat16, device="npu"
         )
-        return buffer, [dist.irecv(buffer, src=peer, group=group)]
+        aux_buffer = None
+        if self.channel_type == LwdChannelType.UP and req.aux_num_elements > 0:
+            # aux 帧尺寸 = num_tokens*3(mrope positions);dtype 取
+            # 请求的 aux_dtype(缺省 int64),与发送端严格同 numel。
+            aux_buffer = torch.empty(
+                req.aux_num_elements,
+                dtype=req.aux_dtype or torch.int64,
+                device="npu",
+            )
+            return buffer, aux_buffer, [
+                dist.irecv(buffer, src=peer, group=group),
+                dist.irecv(aux_buffer, src=peer, group=group),
+            ]
+        if req.aux_num_elements > 0:
+            raise RuntimeError(
+                "aux payload is only supported on the UP channel"
+            )
+        return buffer, None, [dist.irecv(buffer, src=peer, group=group)]
 
     def _bridge_and_record(self, handles: list[Any]):
         """Bridge HCCL completion onto the channel stream and record an

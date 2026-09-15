@@ -185,7 +185,6 @@ class LwdCloudWorker(NPUWorker):
         num_tokens = sum(len(t) for t in meta.token_ids)
         if num_tokens <= 0:
             return
-
         lwd = self.parallel_config.lwd_config
         is_endpoint = self.rank == lwd.edge_npu_count
         if is_endpoint:
@@ -195,6 +194,9 @@ class LwdCloudWorker(NPUWorker):
                     op="recv",
                     num_elements=num_tokens * hidden_size,
                     seqno=batch.seqno,
+                    # aux 帧(mrope positions [n,3] int64)仅端点预挂;
+                    # 云 TP 组内扩散由 runner 在消费时刻现场广播补发。
+                    aux_num_elements=num_tokens * 3 if meta.has_mrope else 0,
                 )
             )
         else:
@@ -207,6 +209,10 @@ class LwdCloudWorker(NPUWorker):
             "endpoint=%s",
             batch.seqno, len(meta.req_ids), num_tokens, is_endpoint,
         )
+
+    # 注:take_lwd_up_embeds(host 阻塞收割)不随移植恢复——本线上 UP
+    # 消费已收进 runner(_lwd_inject_remote_embeds:端点过门 + TP 组内
+    # 现场广播),worker 层只保留 post 侧;aux(mrope)帧同路径消费。
 
     @torch.inference_mode()
     def sample_tokens(self, grammar_output: "GrammarOutput") -> ModelRunnerOutput | AsyncModelRunnerOutput:

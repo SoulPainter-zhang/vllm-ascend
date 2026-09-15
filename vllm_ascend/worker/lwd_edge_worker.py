@@ -99,6 +99,12 @@ class LwdEdgeWorker(NPUWorker):
         # order, which only holds once every rank is past its distributed init.
         super().init_device()
         self.comm_service = get_lwd_comm_service()
+        # 多模态请求级缓存:req_id -> mm_features(带 data,首 chunk 随
+        # scheduled_new_reqs 到达时登记) / req_id -> [(mm_position,
+        # encoder_embeds)](视觉塔输出,首用即算)。chunk 窗口越过全部
+        # mm 段后摘除(见 _execute_lwd_embed),finished_req_ids 兜底。
+        self._lwd_mm_features_dict: dict[str, list] = {}
+        self._lwd_mm_embeds_dict: dict[str, list] = {}
 
         from vllm_ascend.distributed import lwd_wire
         lwd_wire.init_lwd_duplex_channels()
@@ -123,6 +129,13 @@ class LwdEdgeWorker(NPUWorker):
 
     def execute_model(self, scheduler_output: "SchedulerOutput"):
         lwd_batch = scheduler_output.lwd_batch
+        # 多模态缓存生命周期:请求完结(含 abort)即摘除其 mm 特征/
+        # encoder 输出缓存,防跨请求泄漏(正常路径在 chunk 越过全部
+        # mm 窗口后已提前摘除,此为兜底)。
+        if scheduler_output.finished_req_ids:
+            for req_id in scheduler_output.finished_req_ids:
+                self._lwd_mm_features_dict.pop(req_id, None)
+                self._lwd_mm_embeds_dict.pop(req_id, None)
         if lwd_batch is None:
             logger.debug("[lwd-edge] step carries no LWD batch; nothing to do")
             return None
@@ -130,12 +143,16 @@ class LwdEdgeWorker(NPUWorker):
         batch_meta = lwd_batch.batch_meta
         if lwd_batch.batch_type == LwdBatchType.LWD_EMBED:
             logger.info(
-                "[Lwd][edge-worker] EMBED seqno=%d reqs=%d tokens=%d",
+                "[Lwd][edge-worker] EMBED seqno=%d reqs=%d tokens=%d "
+                "has_mrope=%s",
                 lwd_batch.seqno,
                 len(batch_meta.req_ids),
                 sum(len(token_ids) for token_ids in batch_meta.token_ids),
+                batch_meta.has_mrope,
             )
-            return self._execute_lwd_embed(lwd_batch.seqno, batch_meta)
+            return self._execute_lwd_embed(
+                lwd_batch.seqno, batch_meta, scheduler_output
+            )
         if lwd_batch.batch_type == LwdBatchType.LWD_UNEMBED:
             logger.info(
                 "[Lwd][edge-worker] UNEMBED seqno=%d reqs=%d accepted=%d "
@@ -181,10 +198,28 @@ class LwdEdgeWorker(NPUWorker):
         dev[:n].copy_(stage[:n], non_blocking=True)
         return dev[:n]
 
-    def _execute_lwd_embed(self, seqno: int, batch_meta: LwdEmbedBatch) -> None:
+    def _execute_lwd_embed(
+        self,
+        seqno: int,
+        batch_meta: LwdEmbedBatch,
+        scheduler_output: "SchedulerOutput",
+    ) -> None:
         model = self.model_runner.get_model()
         if not batch_meta.token_ids:
             return
+
+        # 登记新到请求的 mm 特征(首 chunk 随 scheduled_new_reqs 携带
+        # data;后续 chunk 走缓存)。注意登记不过滤 data:None 的项留到
+        # encoder 执行点 fail-fast(见 _lwd_mm_encoder_outputs)——静默
+        # 跳过会让图像 embeds 缺失、占位 token 按文本嵌入,即错算。
+        for req_data in scheduler_output.scheduled_new_reqs:
+            feats = [
+                f
+                for f in req_data.mm_features
+                if f.modality != "prompt_embeds"
+            ]
+            if feats:
+                self._lwd_mm_features_dict[req_data.req_id] = feats
 
         # Flatten all requests' prompt tokens into one batch (order = req_ids).
         flat_token_ids = [tid for token_ids in batch_meta.token_ids for tid in token_ids]
@@ -193,14 +228,46 @@ class LwdEdgeWorker(NPUWorker):
         )
         token_ids_tensor = self._lwd_embed_ids_h2d(flat_token_ids)
         _t0 = time.monotonic()
-        embeds = model.embed_input_ids(token_ids_tensor)      # (total_N, H)
+        # 多模态 merge:批内任一请求带 mm 数据即按本 chunk 窗口收集
+        # 视觉塔 embeds + 构造 is_multimodal 掩码,走模型原生
+        # embed_input_ids 的 merge 分支;纯文本批走原直达路径。
+        mm_embeds, is_mm = self._lwd_gather_chunk_mm(batch_meta)
+        if mm_embeds:
+            embeds = model.embed_input_ids(
+                token_ids_tensor,
+                multimodal_embeddings=mm_embeds,
+                is_multimodal=is_mm,
+            )
+        else:
+            embeds = model.embed_input_ids(token_ids_tensor)  # (total_N, H)
         _t_fwd = time.monotonic()
+
+        aux_tensor = None
+        if batch_meta.has_mrope:
+            aux_tensor = torch.tensor(
+                batch_meta.mrope_positions, dtype=torch.int64, device=device
+            )
+            assert aux_tensor.shape == (len(flat_token_ids), 3), (
+                f"mrope rows {aux_tensor.shape[0]} != chunk tokens "
+                f"{len(flat_token_ids)} (seqno={seqno})"
+            )
+
+        from vllm_ascend.distributed import lwd_wire
+        lwd_wire.dump_tensor(
+            f"[Lwd][DUMP][req={batch_meta.req_ids}][seqno={seqno}] "
+            f"SEND UP embeds",
+            embeds,
+        )
         request = LwdCommRequest(
             channel=LwdChannelType.UP,
             op="send",
             num_elements=embeds.numel(),                     # total_N * H
             tensor=embeds,
             seqno=seqno,
+            aux_tensor=aux_tensor,
+            aux_num_elements=(
+                aux_tensor.numel() if aux_tensor is not None else 0
+            ),
         )
         self.comm_service.submit_send(request)
         # [Lwd][perf] TTFT 探针:forward=embed 前向;submit_send=快照clone+
@@ -214,6 +281,108 @@ class LwdEdgeWorker(NPUWorker):
             (time.monotonic() - _t0) * 1000,
             len(flat_token_ids),
         )
+
+    # ------------------------------------------------------------------ #
+    # Multimodal (image) merge helpers                                     #
+    # ------------------------------------------------------------------ #
+
+    def _lwd_mm_encoder_outputs(self, req_id: str) -> list:
+        """视觉塔输出(请求级惰性计算+缓存):[(mm_position, embeds)]。
+
+        embeds 按 mm_hash 语义本应跨请求共享,这里按请求缓存(单请求
+        组批下重复图极少);输出常驻至该请求 chunk 流越过全部 mm 窗口。"""
+        cached = self._lwd_mm_embeds_dict.get(req_id)
+        if cached is not None:
+            return cached
+        features = self._lwd_mm_features_dict.get(req_id)
+        if not features:
+            return []
+        missing = [f.identifier for f in features if f.data is None]
+        if missing:
+            # data 缺失即无法计算图像 embeds——静默跳过 = 图像 token 按
+            # 文本嵌入错算,fail-fast。
+            raise RuntimeError(
+                f"[Lwd] mm feature data missing for req={req_id} "
+                f"(mm_hashes={missing}): cannot compute image embeddings; "
+                "check mm processor/receiver cache chain"
+            )
+        model = self.model_runner.get_model()
+        from vllm.multimodal.utils import group_and_batch_mm_kwargs
+
+        mm_kwargs = [(f.modality, f.data) for f in features]
+        outputs_by_modality: dict[str, list] = {}
+        for modality, num_items, mm_kwargs_batch in group_and_batch_mm_kwargs(
+            mm_kwargs,
+            device=self.model_runner.device,
+            pin_memory=getattr(self.model_runner, "pin_memory", False),
+        ):
+            batch_outputs = model.embed_multimodal(**mm_kwargs_batch)
+            assert len(batch_outputs) == num_items, (
+                f"encoder outputs {len(batch_outputs)} != items "
+                f"{num_items} (req={req_id}, modality={modality})"
+            )
+            outputs_by_modality.setdefault(modality, []).extend(batch_outputs)
+        result = []
+        for feature in features:
+            result.append(
+                (feature.mm_position, outputs_by_modality[feature.modality].pop(0))
+            )
+        self._lwd_mm_embeds_dict[req_id] = result
+        logger.info(
+            "[Lwd][edge-worker] mm encoder done: req=%s items=%d",
+            req_id, len(result),
+        )
+        return result
+
+    def _lwd_gather_chunk_mm(self, batch_meta: LwdEmbedBatch):
+        """按本 chunk 窗口收集 mm embeds 行 + 构造 is_multimodal 掩码。
+
+        窗口语义逐字对齐原生 _gather_mm_embeddings:feature 的占位区间
+        [offset, offset+length) 与 chunk 窗口 [p_offset, p_offset+n) 求交,
+        相交段切 embeds 行、置掩码位;图像跨 chunk 时逐段收集。同时完成
+        越过全部 mm 窗口请求的缓存摘除。"""
+        total = sum(len(t) for t in batch_meta.token_ids)
+        is_mm = torch.zeros(total, dtype=torch.bool)
+        mm_embeds: list = []
+        if len(batch_meta.prompt_offsets) != len(batch_meta.req_ids):
+            return mm_embeds, is_mm
+        req_start = 0
+        for req_id, token_ids, p_offset in zip(
+            batch_meta.req_ids, batch_meta.token_ids, batch_meta.prompt_offsets
+        ):
+            n = len(token_ids)
+            cached = self._lwd_mm_encoder_outputs(req_id)
+            max_end = 0
+            for pos_info, item_embeds in cached:
+                start_pos = pos_info.offset
+                num_encoder_tokens = pos_info.length
+                max_end = max(max_end, start_pos + num_encoder_tokens)
+                start_idx = max(p_offset - start_pos, 0)
+                end_idx = min(
+                    p_offset - start_pos + n, num_encoder_tokens
+                )
+                if start_idx >= end_idx:
+                    continue
+                req_start_pos = req_start + start_pos - p_offset
+                if (is_embed := pos_info.is_embed) is not None:
+                    s, e = pos_info.get_embeds_indices_in_range(
+                        start_idx, end_idx
+                    )
+                    if s == e:
+                        continue
+                    rows = item_embeds[s:e]
+                    is_mm[req_start_pos + start_idx : req_start_pos + end_idx] |= (
+                        is_embed[start_idx:end_idx]
+                    )
+                else:
+                    rows = item_embeds[start_idx:end_idx]
+                    is_mm[req_start_pos + start_idx : req_start_pos + end_idx] = True
+                mm_embeds.append(rows)
+            if cached and p_offset + n >= max_end:
+                self._lwd_mm_features_dict.pop(req_id, None)
+                self._lwd_mm_embeds_dict.pop(req_id, None)
+            req_start += n
+        return mm_embeds, is_mm
 
     def _execute_lwd_unembed(
         self, seqno: int, batch_meta: LwdUnembedBatch
