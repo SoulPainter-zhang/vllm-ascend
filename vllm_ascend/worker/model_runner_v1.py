@@ -2463,6 +2463,25 @@ class NPUModelRunner(GPUModelRunner):
                 batch_desc,
             )
             self._copy_draft_token_ids_to_cpu(scheduler_output)
+            if self._lwd_spec_persist_enabled and torch.is_tensor(
+                self._draft_token_ids
+            ):
+                # LWD:按请求持久化本步草稿(设备视图,零拷贝零同步)。
+                # 批次级 _draft_token_ids 会被下一步 propose 覆写,而
+                # 相位交替下恢复请求(prev_positions=-1)需要取回自己
+                # 最后一个 decode 步的草稿;prefill 步的首趟草稿同样
+                # 在此登记(其首个 decode 步也是恢复步)。请求缺席期间
+                # 无新 token 提交,草稿持续合法;离场即清理。
+                n_draft_rows = self._draft_token_ids.shape[0]
+                for row_idx, draft_req_id in enumerate(
+                    self.input_batch.req_ids[:n_draft_rows]
+                ):
+                    self._lwd_draft_stash[draft_req_id] = self._draft_token_ids[
+                        row_idx
+                    ]
+                for stale_req_id in list(self._lwd_draft_stash):
+                    if stale_req_id not in self.requests:
+                        del self._lwd_draft_stash[stale_req_id]
 
         (
             logprobs_lists,
