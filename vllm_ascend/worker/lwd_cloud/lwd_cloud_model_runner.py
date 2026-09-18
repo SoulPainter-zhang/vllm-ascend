@@ -18,6 +18,7 @@ import time
 import torch
 from vllm.logger import logger
 
+from vllm_ascend import envs
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 
