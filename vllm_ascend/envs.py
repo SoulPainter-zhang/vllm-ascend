@@ -41,6 +41,15 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_LWD_EDGE_SKIP_SAMPLE": lambda: int(
         os.getenv("VLLM_ASCEND_LWD_EDGE_SKIP_SAMPLE", 0)
     ),
+    # LWD diagnostic: when set to 1, the cloud skips DOWN collect and
+    # tensor send entirely; the c2e notify carries only per-request
+    # token ids (hidden_num_elements=0), and the edge delivers them
+    # directly without dispatching an UNEMBED batch or posting any recv.
+    # Used to measure performance with the whole collect/DOWN path
+    # removed. Default 0. Never enable in production.
+    "VLLM_ASCEND_LWD_DISABLE_DOWN": lambda: int(
+        os.getenv("VLLM_ASCEND_LWD_DISABLE_DOWN", 0)
+    ),
     # The build type of the package. It can be one of the following values:
     # Release, Debug, RelWithDebugInfo. If not set, the default value is Release.
     "CMAKE_BUILD_TYPE": lambda: os.getenv("CMAKE_BUILD_TYPE"),

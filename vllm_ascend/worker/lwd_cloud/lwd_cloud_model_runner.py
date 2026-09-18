@@ -259,7 +259,11 @@ class LwdCloudModelRunner(NPUModelRunner):
             )
         self._lwd_captured_sampler_output = None
         output = super().sample_tokens(grammar_output)
-        if captured is not None and self._lwd_captured_sampler_output is not None:
+        # VLLM_ASCEND_LWD_DISABLE_DOWN=1 诊断:不做 collect(云引擎改走
+        # token_ids 直通通告),payload 为 None 时 worker 自然跳过 DOWN send
+        if (captured is not None
+                and self._lwd_captured_sampler_output is not None
+                and not envs.VLLM_ASCEND_LWD_DISABLE_DOWN):
             self._lwd_pending_down_payload = self._lwd_collect_down_payload(
                 captured[0], captured[1], captured[2], captured[3],
                 captured[4], captured[5], self._lwd_captured_sampler_output,
