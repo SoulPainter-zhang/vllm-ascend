@@ -153,9 +153,36 @@ class LwdEdgeWorker(NPUWorker):
         )
         return None
 
+    def _lwd_embed_ids_h2d(self, flat_token_ids: list[int]) -> torch.Tensor:
+        """token ids 异步上卡:pinned 环(4 槽,与派发队列深度同阶)+
+        non_blocking,替代 torch.tensor(list, device=...) 的 pageable
+        同步拷贝——后者在主流上等设备排空(含上一块 chunk 的 UP send
+        配对等待),把跨侧锁步传导进边 worker 主线程。同流序保证 embed
+        kernel 读到的一定是本 chunk 的值(H2D 先于 embed 入队)。"""
+        n = len(flat_token_ids)
+        ring = getattr(self, "_lwd_ids_ring", None)
+        if ring is None or ring[0][0].numel() < n:
+            m = max(n, 8192)
+            ring = [
+                (
+                    torch.empty(m, dtype=torch.int64, pin_memory=True),
+                    torch.empty(
+                        m, dtype=torch.int64, device=self.model_runner.device
+                    ),
+                )
+                for _ in range(4)
+            ]
+            self._lwd_ids_ring = ring
+            self._lwd_ids_ring_idx = 0
+        idx = self._lwd_ids_ring_idx
+        self._lwd_ids_ring_idx = (idx + 1) % len(ring)
+        stage, dev = ring[idx]
+        stage.numpy()[:n] = flat_token_ids
+        dev[:n].copy_(stage[:n], non_blocking=True)
+        return dev[:n]
+
     def _execute_lwd_embed(self, seqno: int, batch_meta: LwdEmbedBatch) -> None:
         model = self.model_runner.get_model()
-        device = self.model_runner.device
         if not batch_meta.token_ids:
             return
 
@@ -164,7 +191,7 @@ class LwdEdgeWorker(NPUWorker):
         logger.debug(
             "[Lwd][edge-worker] embed token_ids=%s", flat_token_ids
         )
-        token_ids_tensor = torch.tensor(flat_token_ids, dtype=torch.long, device=device)
+        token_ids_tensor = self._lwd_embed_ids_h2d(flat_token_ids)
         _t0 = time.monotonic()
         embeds = model.embed_input_ids(token_ids_tensor)      # (total_N, H)
         _t_fwd = time.monotonic()
