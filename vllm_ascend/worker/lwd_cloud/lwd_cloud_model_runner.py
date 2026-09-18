@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import time
 
+import numpy as np
 import torch
 from vllm.logger import logger
 
@@ -303,6 +304,7 @@ class LwdCloudModelRunner(NPUModelRunner):
         is_spec = spec_decode_metadata is not None
 
         rows_list, ranks_list, accepted = [], [], []
+        hidden_packet: torch.Tensor | None = None
         lg = logits  # bf16 原生,直接比较(cast 无精度增益)
         full_cover = all(valid[: len(batch_req_ids)])
         if not is_spec:
@@ -316,10 +318,9 @@ class LwdCloudModelRunner(NPUModelRunner):
             rows_list.extend(sample_hidden_states[i : i + 1] for i in idx)
             accepted.extend([1] * len(idx))
         else:
-            # 全零同步 spec 路径:
+            # 全零同步 spec 路径(向量化):
             # 段长按 host 侧 scheduled_spec_decode_tokens 推(1+draft_len),
             # 按完整段打包(含被拒行,边侧按 num_accepted 取有效前缀);
-            # counts 用框架每步已算好的 num_accepted_tokens.gpu(纯 device)
             # 段长取 spec_decode_metadata.num_draft_tokens(host list,
             # 运行期真实布局,与 sample_hidden_states 段结构一致);
             # 不用 scheduler_output.scheduled_spec_decode_tokens
@@ -331,41 +332,71 @@ class LwdCloudModelRunner(NPUModelRunner):
             # 天然按批位对齐);seg_lens/counts 只收 valid 请求,
             # 保证 [ranks|counts|seg_lens] 三段长度一致
             counts_all = (sampled != -1).sum(dim=1)
-            counts_list = []
-            seg_lens_list = []
-            seg_start = 0
-            for i in range(len(batch_req_ids)):
-                seg_len = seg_lens[i]
-                seg_lg = lg[seg_start : seg_start + seg_len]
-                seg_hidden = sample_hidden_states[seg_start : seg_start + seg_len]
-                rows_i = seg_hidden.shape[0]
-                if valid[i] and rows_i >= 1:
-                    # 过期 sampled 位(spec 未运行的请求可能残留上个
-                    # spec 步的 token):accepted/秩/段长一律按实际
-                    # hidden 行数封顶——行数才是真实采样位置的真相
-                    seg_sm = sampled[i, :rows_i]
-                    thresh = seg_lg.gather(1, seg_sm.long().unsqueeze(1))
-                    ranks_list.append((seg_lg > thresh).sum(dim=1).to(torch.int32))
-                    rows_list.append(seg_hidden)
-                    counts_list.append(
-                        torch.clamp(counts_all[i : i + 1], max=rows_i))
-                    seg_lens_list.append(rows_i)
-                seg_start += seg_len
-            accepted = None  # 不再 host 读取;counts 直接随 meta_dev 下发
-        if not rows_list:
-            return None
-
-        hidden_packet = torch.cat(rows_list)
+            # host 一趟建索引,替代逐请求 device 循环(原实现每请求
+            # ~6 次小 kernel 发射,rank 段随并发涨到 20+ms;向量化后
+            # 发射数与 N 无关)。索引语义与原循环逐位等价:
+            # vidx/vlen = 有效请求批位/实际行数(按总段长封顶,
+            # = 原 rows_i);req_idx/pos_idx = 每行的请求位/行内位
+            # (原 sampled[i, :rows_i]);row_sel = 有效行全局行号。
+            seg_lens_np = np.asarray(seg_lens, dtype=np.int32)
+            seg_starts = np.cumsum(seg_lens_np) - seg_lens_np
+            total_rows = sample_hidden_states.shape[0]
+            rows_per_req = np.minimum(
+                seg_lens_np, np.maximum(total_rows - seg_starts, 0)
+            )
+            vidx_np = np.nonzero(
+                valid[: len(batch_req_ids)] & (rows_per_req >= 1)
+            )[0].astype(np.int64)
+            if vidx_np.size == 0:
+                return None
+            vlen_np = rows_per_req[vidx_np].astype(np.int64)
+            starts_v = seg_starts[vidx_np].astype(np.int64)
+            n_rows = int(vlen_np.sum())
+            req_idx_np = np.repeat(vidx_np, vlen_np)
+            pos_idx_np = np.arange(n_rows, dtype=np.int64) - np.repeat(
+                np.cumsum(vlen_np) - vlen_np, vlen_np
+            )
+            row_sel_np = np.repeat(starts_v, vlen_np) + pos_idx_np
+            # 全部索引一次 pinned 异步 H2D(pageable 同步 H2D 会在
+            # 主流上等设备排空,见 seg_lens 同款教训)
+            buf = self._lwd_h2d_stage_i64(
+                np.concatenate(
+                    [req_idx_np, pos_idx_np, row_sel_np, vidx_np, vlen_np]
+                )
+            )
+            n_valid = vidx_np.size
+            req_d, pos_d = buf[:n_rows], buf[n_rows : 2 * n_rows]
+            sel_d = buf[2 * n_rows : 3 * n_rows]
+            vidx_d = buf[3 * n_rows : 3 * n_rows + n_valid]
+            vlen_d = buf[3 * n_rows + n_valid :]
+            sampled_rows = sampled[req_d, pos_d]
+            if n_rows == total_rows:
+                # 全 valid 无封顶:行即连续前缀,免 gather
+                lg_rows = lg[:n_rows]
+                hidden_packet = sample_hidden_states[:n_rows]
+            else:
+                lg_rows = lg[sel_d]
+                hidden_packet = sample_hidden_states[sel_d]
+            thresh = lg_rows.gather(1, sampled_rows.long().unsqueeze(1))
+            ranks_list.append((lg_rows > thresh).sum(dim=1).to(torch.int32))
+            # 过期 sampled 位(spec 未运行的请求可能残留上个 spec 步的
+            # token):accepted/秩/段长一律按实际 hidden 行数封顶——
+            # 行数才是真实采样位置的真相
+            counts_dev = torch.minimum(counts_all[vidx_d], vlen_d).to(
+                torch.int32
+            )
+            seg_lens_list = vlen_np.tolist()
+        if hidden_packet is None:
+            if not rows_list:
+                return None
+            hidden_packet = torch.cat(rows_list)
         n_req = sum(1 for i in range(len(batch_req_ids)) if valid[i])
         seg_lens_host: list[int] | None = None
         if is_spec:
-            counts_dev = torch.cat(counts_list).to(torch.int32)
             meta_dev = torch.cat(ranks_list + [counts_dev])
-            # seg_lens 不上设备:torch.tensor(list, device=...) 是同步
-            # H2D,会在主流上等设备排空——MTP 下等到的恰好是 draft
-            # propose 尾巴(实测 collect rank 段 ~6ms)。改为 host 直写
-            # pinned 尾段:与 D2H 前缀区域不相交,且引擎读 pinned 发生
-            # 在 ready_event 同步(更晚)之后,无竞态。
+            # seg_lens 不上设备(host 直写 pinned 尾段):与 D2H 前缀
+            # 区域不相交,且引擎读 pinned 发生在 ready_event 同步
+            # (更晚)之后,无竞态。
             seg_lens_host = seg_lens_list
         else:
             counts_dev = torch.ones(n_req, dtype=torch.int32,
@@ -415,4 +446,30 @@ class LwdCloudModelRunner(NPUModelRunner):
         idx = self._lwd_pinned_ring_idx
         self._lwd_pinned_ring_idx = (idx + 1) % len(ring)
         return ring[idx]
+
+    def _lwd_h2d_stage_i64(self, arr: "np.ndarray") -> torch.Tensor:
+        """int64 host 索引数组的异步 H2D 暂存(pinned 4 槽轮换 +
+        non_blocking):替代 torch.tensor(arr, device=...) 的 pageable
+        同步拷贝——后者在主流上等设备排空(MTP 下即 draft propose
+        尾巴)。环深与 meta ring 同理:覆盖 batch_queue 深度 + 引擎滞后,
+        防止下步 host 覆写时上步拷贝尚未执行。"""
+        n = arr.size
+        ring = getattr(self, "_lwd_h2d_ring", None)
+        if ring is None or ring[0][0].numel() < n:
+            m = max(n, 1024)
+            ring = [
+                (
+                    torch.empty(m, dtype=torch.int64, pin_memory=True),
+                    torch.empty(m, dtype=torch.int64, device=self.device),
+                )
+                for _ in range(4)
+            ]
+            self._lwd_h2d_ring = ring
+            self._lwd_h2d_ring_idx = 0
+        idx = self._lwd_h2d_ring_idx
+        self._lwd_h2d_ring_idx = (idx + 1) % len(ring)
+        stage, dev = ring[idx]
+        stage.numpy()[:n] = arr
+        dev[:n].copy_(stage[:n], non_blocking=True)
+        return dev[:n]
 
