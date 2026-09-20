@@ -1367,15 +1367,23 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         Alignment with ``set_inputs_first_pass``: after the one-position
         right shift, position j of request i holds prompt token j+1, so
         its input embedding is exactly prompt_embeds[j+1]; the sampling
-        position of each request holds the next token, embedded by the
-        draft model itself (its own embed table — only the prompt span is
-        replaced by the received embeddings).
+        position of each request holds the next token (already shifted
+        into ``self.input_ids`` by the caller).
+
+        逐请求混合构造(mixed 组批后批内可同时存在 prefill/decode 请求):
+        先用 token-id 路径整批打底——右移后 decode 段是真实 token、采样
+        位置是 next token,只有 prompt 段是占位零值;再仅对段内含
+        prompt 行(base+1 < prompt_len)的请求用 provider embeds 覆写。
+        decode 请求(装配缓冲已随 prefill 完结释放)不查 provider,不再
+        像原实现那样因任一请求缺缓冲而整批回退——那会让同批 prefill
+        请求的 prompt 段退回占位零值,draft 状态从根上脏掉(MTP 混批
+        下的已知缺陷)。
 
         Returns None (caller falls back to the token-id path) when no
-        provider is configured, any request lacks received embeds, the
-        chunk's rows are not yet fully assembled, the draft model does
-        not consume ``inputs_embeds``, or a CP (pcp) manager rewrites
-        first-pass inputs (different layout).
+        provider is configured, a request that needs prompt embeds lacks
+        received rows / the chunk's rows are not yet fully assembled, the
+        draft model does not consume ``inputs_embeds``, or a CP (pcp)
+        manager rewrites first-pass inputs (different layout).
         """
         provider = self._lwd_prompt_embeds_provider
         runner = self.runner
@@ -1413,15 +1421,25 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         computed = getattr(runner.input_batch, "num_computed_tokens_cpu", None)
         if computed is None:
             return None
+        num_prompt = runner.input_batch.num_prompt_tokens
         qsl = (cad.query_start_loc_cpu.tolist()
                if getattr(cad, "query_start_loc_cpu", None) is not None
                else cad.query_start_loc.tolist())
         out = self.inputs_embeds  # persistent buffer (graph-safe)
+        # 打底:右移后的 input_ids 在 decode 段/采样位置都是真实 token,
+        # 整批嵌入一次;prompt 段的占位零值嵌入在下方逐请求覆写
+        out[:num_tokens] = self.model.embed_input_ids(
+            self.input_ids[:num_tokens]
+        )
         wrote_any = False
         for i, req_id in enumerate(req_ids):
             s, e = int(qsl[i]), int(qsl[i + 1])
             seg_len = e - s
             base = int(computed[i]) if i < len(computed) else 0
+            prompt_len = int(num_prompt[i]) if i < len(num_prompt) else 0
+            if base + 1 >= prompt_len:
+                # 段内无 prompt 行(decode 请求):打底已正确,不查 provider
+                continue
             prompt_embeds = provider(req_id)  # [prompt_len, H] or None
             if prompt_embeds is None or prompt_embeds.shape[0] < base + seg_len:
                 return None  # chunk rows not fully assembled -> token-id path
@@ -1430,10 +1448,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             wrote_any = True
         if not wrote_any:
             return None
-        # sampling positions hold the next token (embedded by the draft
-        # model's own table)
-        next_embeds = self.model.embed_input_ids(next_token_ids)
-        out[token_indices_to_sample] = next_embeds
         return out[:num_input_tokens]
 
     def set_inputs_first_pass(
