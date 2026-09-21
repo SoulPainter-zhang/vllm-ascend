@@ -47,9 +47,48 @@ class LwdCloudModelRunner(NPUModelRunner):
         """
         out = super()._prepare_inputs(scheduler_output, num_scheduled_tokens)
         if self._lwd_enabled():
+            self._lwd_rebuild_is_token_ids_mask(num_scheduled_tokens)
             self._lwd_release_consumed_prompt_embeds()
             self._lwd_inject_remote_embeds(scheduler_output, num_scheduled_tokens)
         return out
+
+    def _lwd_rebuild_is_token_ids_mask(self, num_scheduled_tokens) -> None:
+        """重建 prompt-embeds 分支的扁平 is_token_ids 掩码。
+
+        根因(async spec decode 乐观值):runner 的 num_computed_tokens_cpu
+        假设上步草稿全被接受(比真实提交位置多 r),而原生扁平化
+        (model_runner_v1.py 的 token_indices = positions + idx*M)用乐观
+        positions 从二维掩码取值——decode 行整体右移 r 位,每段末尾
+        r 行越出 True 标记区读到 False/陈旧值,被 prompt-embeds 分支
+        当作 embeds 行而不做本地嵌入,保留 inputs_embeds.gpu 的陈旧
+        垃圾;这些行恰是被采样行(logits_indices 取段末 1+k 行),
+        垃圾 logits 直接污染已提交 token。原生/phase/单请求不受影响
+        (掩码只在 prompt-embeds 分支被消费,那些形态走 MM 分支)。
+
+        LWD 语义里只有注入行(prompt 段)应是 embeds 行(False),
+        decode/草稿行恒为 token id(True)。此处按调度状态确定性重建,
+        不依赖任何乐观值修正:decode 请求的 computed 乐观只会偏大,
+        prefill_rows 恒为 0,天然安全。GPU 侧掩码全仓只写不读,只需
+        修 CPU 视图(.np 与 .cpu 同存储)。
+        """
+        if not self.input_batch.req_prompt_embeds:
+            # 批内无 embeds 缓冲(MM/text 分支,掩码无人读)
+            return
+        mask = self.is_token_ids.np
+        computed = self.input_batch.num_computed_tokens_cpu
+        num_prompt = self.input_batch.num_prompt_tokens
+        n_reqs = len(num_scheduled_tokens)
+        total = int(np.sum(num_scheduled_tokens[:n_reqs]))
+        mask[:total] = True
+        off = 0
+        for i in range(n_reqs):
+            n = int(num_scheduled_tokens[i])
+            prefill_rows = min(
+                n, max(int(num_prompt[i]) - int(computed[i]), 0)
+            )
+            if prefill_rows > 0:
+                mask[off : off + prefill_rows] = False
+            off += n
 
     def _lwd_enabled(self) -> bool:
         cfg = getattr(self.vllm_config, "lwd_config", None)
