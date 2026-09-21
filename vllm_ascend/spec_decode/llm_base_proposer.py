@@ -1440,15 +1440,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             if base + 1 >= prompt_len:
                 # 段内无 prompt 行(decode 请求):打底已正确,不查 provider
                 continue
-            # token_id 上线路(精度排查手段):云侧请求携带真实 prompt id
-            # 时,token-id 打底即正确,draft 走原生 token-id 路径,不再
-            # 用 provider 覆写(正式方案去 id 后自动恢复 provider 路径)
-            req_state = runner.requests.get(req_id)
-            if (
-                req_state is not None
-                and req_state.prompt_token_ids is not None
-            ):
-                continue
             prompt_embeds = provider(req_id)  # [prompt_len, H] or None
             if prompt_embeds is None or prompt_embeds.shape[0] < base + seg_len:
                 return None  # chunk rows not fully assembled -> token-id path
