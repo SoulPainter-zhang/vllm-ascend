@@ -245,7 +245,8 @@ class LwdEdgeWorker(NPUWorker):
         aux_tensor = None
         if batch_meta.has_mrope:
             aux_tensor = torch.tensor(
-                batch_meta.mrope_positions, dtype=torch.int64, device=device
+                batch_meta.mrope_positions, dtype=torch.int64,
+                device=self.model_runner.device,
             )
             assert aux_tensor.shape == (len(flat_token_ids), 3), (
                 f"mrope rows {aux_tensor.shape[0]} != chunk tokens "
