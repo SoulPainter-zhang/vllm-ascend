@@ -252,12 +252,6 @@ class LwdEdgeWorker(NPUWorker):
                 f"{len(flat_token_ids)} (seqno={seqno})"
             )
 
-        from vllm_ascend.distributed import lwd_wire
-        lwd_wire.dump_tensor(
-            f"[Lwd][DUMP][req={batch_meta.req_ids}][seqno={seqno}] "
-            f"SEND UP embeds",
-            embeds,
-        )
         request = LwdCommRequest(
             channel=LwdChannelType.UP,
             op="send",
