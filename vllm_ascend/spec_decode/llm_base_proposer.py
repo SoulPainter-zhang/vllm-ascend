@@ -147,6 +147,23 @@ def _is_glm_model(model_config) -> bool:
     return "glm" in str(model_type).lower()
 
 
+def _backup_token_id(req_state, idx: int) -> int:
+    """get_token_id 的占位 embeds 容错。
+
+    LWD(prefill_only)云侧请求的 prompt 以 embeds 注入,
+    prompt_token_ids 为 None,对 prompt 位置取 id 会 raise
+    (gpu_input_batch.py:get_token_id)。backup 值只在该请求本步
+    无有效采样 token 时才被 torch.where 选中:对 prefill 半途
+    (chunk)请求,该位置的 draft 输入由 provider embeds 覆写
+    (_lwd_build_first_pass_embeds 的 prompt 段覆写),id 不会真实
+    落进 draft 前向,回填 0 占位即可;decode/完结请求恒有有效
+    采样 token,backup 不被消费。
+    """
+    if req_state.prompt_token_ids is None and idx < req_state.num_prompt_tokens:
+        return 0
+    return req_state.get_token_id(idx)
+
+
 class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
     _runnable: ACLGraphWrapper | Callable
 
@@ -1840,10 +1857,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # TODO(Ben): Combine this into a custom fused kernel
 
         # Precompute get_token_id for when there is no valid next token
+        # (_backup_token_id:LWD 占位 embeds 请求的 prompt 位 id 不可知,
+        # 回填 0 占位——该值真实被消费的位置必由 provider embeds 覆写)
         num_reqs = gpu_input_batch.num_reqs
         seq_lens_list = (gpu_input_batch.num_tokens_no_spec[:num_reqs] - 1).tolist()
         self.backup_next_token_ids.np[:num_reqs] = np.array(
-            [requests[gpu_input_batch.req_ids[i]].get_token_id(seq_lens_list[i]) for i in range(num_reqs)]
+            [_backup_token_id(requests[gpu_input_batch.req_ids[i]], seq_lens_list[i]) for i in range(num_reqs)]
         )
         self.backup_next_token_ids.copy_to_gpu(num_reqs)
 
