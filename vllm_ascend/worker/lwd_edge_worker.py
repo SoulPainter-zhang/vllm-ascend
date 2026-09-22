@@ -242,15 +242,33 @@ class LwdEdgeWorker(NPUWorker):
             embeds = model.embed_input_ids(token_ids_tensor)  # (total_N, H)
         _t_fwd = time.monotonic()
 
+        # aux 帧(mrope positions):pdmix 混批下 has_mrope 是逐请求
+        # 列表——仅标记请求贡献行,按 req_ids 序拼接(云侧注入按同序
+        # 逐请求消费);纯文本请求零 aux 流量。
+        aux_rows = [
+            row
+            for hm, rows in zip(
+                batch_meta.has_mrope, batch_meta.mrope_positions
+            )
+            if hm
+            for row in rows
+        ]
         aux_tensor = None
-        if batch_meta.has_mrope:
+        if aux_rows:
             aux_tensor = torch.tensor(
-                batch_meta.mrope_positions, dtype=torch.int64,
+                aux_rows, dtype=torch.int64,
                 device=self.model_runner.device,
             )
-            assert aux_tensor.shape == (len(flat_token_ids), 3), (
-                f"mrope rows {aux_tensor.shape[0]} != chunk tokens "
-                f"{len(flat_token_ids)} (seqno={seqno})"
+            expected_rows = sum(
+                len(token_ids)
+                for hm, token_ids in zip(
+                    batch_meta.has_mrope, batch_meta.token_ids
+                )
+                if hm
+            )
+            assert aux_tensor.shape == (expected_rows, 3), (
+                f"mrope rows {aux_tensor.shape[0]} != mrope-req chunk "
+                f"tokens {expected_rows} (seqno={seqno})"
             )
 
         request = LwdCommRequest(

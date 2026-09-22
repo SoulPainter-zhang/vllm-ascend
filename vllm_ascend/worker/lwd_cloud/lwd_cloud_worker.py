@@ -195,8 +195,14 @@ class LwdCloudWorker(NPUWorker):
                     num_elements=num_tokens * hidden_size,
                     seqno=batch.seqno,
                     # aux 帧(mrope positions [n,3] int64)仅端点预挂;
+                    # pdmix 混批下 has_mrope 为逐请求列表,aux 帧只含
+                    # 标记请求的行(Σ n_i×3,与边侧组帧同源同序);
                     # 云 TP 组内扩散由 runner 在消费时刻现场广播补发。
-                    aux_num_elements=num_tokens * 3 if meta.has_mrope else 0,
+                    aux_num_elements=sum(
+                        len(t)
+                        for t, hm in zip(meta.token_ids, meta.has_mrope)
+                        if hm
+                    ) * 3,
                 )
             )
         else:
