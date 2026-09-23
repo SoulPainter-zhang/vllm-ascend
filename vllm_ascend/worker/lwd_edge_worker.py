@@ -231,6 +231,7 @@ class LwdEdgeWorker(NPUWorker):
         dev[:n].copy_(stage[:n], non_blocking=True)
         return dev[:n]
 
+    @torch.inference_mode()
     def _execute_lwd_embed(
         self,
         seqno: int,
@@ -350,6 +351,7 @@ class LwdEdgeWorker(NPUWorker):
         cached = self._lwd_mm_embeds_dict.get(req_id)
         if cached is not None:
             return cached
+        _t_enc = time.monotonic()
         features = self._lwd_mm_features_dict.get(req_id)
         if not features:
             return []
@@ -384,9 +386,10 @@ class LwdEdgeWorker(NPUWorker):
                 (feature.mm_position, outputs_by_modality[feature.modality].pop(0))
             )
         self._lwd_mm_embeds_dict[req_id] = result
+        # [Lwd][perf] 视觉塔逐请求耗时(MM 劣化归因:1080p 单卡串行前向)
         logger.info(
-            "[Lwd][edge-worker] mm encoder done: req=%s items=%d",
-            req_id, len(result),
+            "[Lwd][perf] mm-encoder req=%s items=%d dur=%.2fms",
+            req_id, len(result), (time.monotonic() - _t_enc) * 1000,
         )
         return result
 
@@ -440,6 +443,7 @@ class LwdEdgeWorker(NPUWorker):
             req_start += n
         return mm_embeds, is_mm
 
+    @torch.inference_mode()
     def _execute_lwd_unembed(
         self, seqno: int, batch_meta: LwdUnembedBatch
     ) -> ModelRunnerOutput:
