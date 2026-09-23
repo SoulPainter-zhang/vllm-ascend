@@ -127,7 +127,7 @@ class LwdCommFuture:
                             f"{self._request.channel.value} seqno="
                             f"{self._request.seqno}"
                         )
-                    self._done_cond.wait(timeout=remaining or 0.05)
+                    self._done_cond.wait(timeout=remaining or 0.001)
                     continue
                 if self._done_event.query():
                     self._status = LwdCommStatus.OK
@@ -141,7 +141,7 @@ class LwdCommFuture:
                         f"{self._request.channel.value} seqno="
                         f"{self._request.seqno}"
                     )
-                self._done_cond.wait(timeout=min(0.05, remaining or 0.05))
+                self._done_cond.wait(timeout=min(0.001, remaining or 0.001))
             if self._status is LwdCommStatus.ERROR:
                 raise RuntimeError(
                     f"lwd-comm op failed on {self._request.channel.value} "
