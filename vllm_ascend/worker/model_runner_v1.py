@@ -2463,8 +2463,14 @@ class NPUModelRunner(GPUModelRunner):
                 batch_desc,
             )
             self._copy_draft_token_ids_to_cpu(scheduler_output)
-            if self._lwd_spec_persist_enabled and torch.is_tensor(
-                self._draft_token_ids
+            # The LWD snapshot cache owns draft restoration when enabled.
+            # Keep the legacy stash empty so the base runner cannot restore
+            # aliased rows before the snapshot is applied. Accepted-token
+            # persistence still uses _lwd_spec_persist_enabled independently.
+            if (
+                self._lwd_spec_persist_enabled
+                and getattr(self, "_lwd_draft_cache", None) is None
+                and torch.is_tensor(self._draft_token_ids)
             ):
                 # LWD:按请求持久化本步草稿(设备视图,零拷贝零同步)。
                 # 批次级 _draft_token_ids 会被下一步 propose 覆写,而

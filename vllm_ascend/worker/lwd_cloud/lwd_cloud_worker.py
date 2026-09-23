@@ -37,6 +37,7 @@ from vllm_ascend.distributed.lwd_comm.types import LwdChannelType, LwdCommReques
 #（对齐 worker.py 的导入顺序）
 import vllm_ascend.ops  # noqa: F401
 from vllm_ascend.worker.lwd_cloud.lwd_cloud_model_runner import LwdCloudModelRunner
+from vllm_ascend.worker.lwd_hash.lwd_hash_routing import hash_layer_count, hash_payload_numel
 from vllm_ascend.worker.worker import NPUWorker
 
 
@@ -172,7 +173,7 @@ class LwdCloudWorker(NPUWorker):
 
         All control info rides the SchedulerOutput (edge -> cloud
         control plane fills it in):batch.seqno 为边侧派发号(跨机段
-        配对键),recv 尺寸 = sum(len(token_ids)) x H。"""
+        配对键),recv 尺寸包含 embedding 及可选的 Hash 专家 ID。"""
         from vllm.v1.core.sched.output import LwdBatchType
 
         batch = getattr(scheduler_output, "lwd_batch", None)
@@ -192,7 +193,10 @@ class LwdCloudWorker(NPUWorker):
                 LwdCommRequest(
                     channel=LwdChannelType.UP,
                     op="recv",
-                    num_elements=num_tokens * hidden_size,
+                    num_elements=hash_payload_numel(
+                        num_tokens, hidden_size, hash_layer_count(self.model_config.hf_config),
+                        getattr(self.model_config.hf_config, "num_experts_per_tok", 0),
+                    ),
                     seqno=batch.seqno,
                     # aux 帧(mrope positions [n,3] int64)仅端点预挂;
                     # pdmix 混批下 has_mrope 为逐请求列表,aux 帧只含
@@ -284,6 +288,8 @@ class LwdCloudWorker(NPUWorker):
             "[Lwd][cloud-worker] flush finished reqs=%s", list(finished_req_ids)
         )
         for req_id in finished_req_ids:
+            if self.model_runner.lwd_hash_state is not None:
+                self.model_runner.lwd_hash_state.discard(req_id)
             idx = req_id_to_index.get(req_id)
             if idx is not None:
                 embeds_map.pop(idx, None)
