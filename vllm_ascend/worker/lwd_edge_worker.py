@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from vllm.logger import logger
+from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 
 from vllm.v1.core.sched.output import (
     LwdBatchType,
@@ -28,6 +29,8 @@ from vllm_ascend.distributed.lwd_comm.lwd_parallel_init import (
 )
 from vllm_ascend.distributed.lwd_comm.service import get_lwd_comm_service
 from vllm_ascend.distributed.lwd_comm.types import LwdChannelType, LwdCommRequest
+from vllm_ascend.worker.lwd_hash.lwd_hash_routing import pack_hash_payload
+from vllm_ascend.worker.lwd_hash.lwd_hash_tables import load_tid2eid_tables
 from vllm_ascend.worker.worker import NPUWorker
 
 if TYPE_CHECKING:
@@ -59,6 +62,36 @@ def compute_top_id_th(logits: torch.Tensor, token_id: int) -> int:
 # ---- edge worker ----
 class LwdEdgeWorker(NPUWorker):
     """LWD edge worker: embed (prefill) + unembed (token recovery) only."""
+
+    def load_model(self) -> None:
+        """加载边侧模型，并为 DeepSeek V4 从权重文件读取 CPU Hash 路由表。"""
+        super().load_model()
+        self.tid2eid_tables: list[torch.Tensor] = []
+        config = self.model_config.hf_config
+        if getattr(config, "model_type", None) != "deepseek_v4":
+            return
+        num_hash_layers = config.num_hash_layers
+        if not 0 <= num_hash_layers <= config.num_hidden_layers:
+            raise ValueError(f"Invalid DeepSeek V4 num_hash_layers: {num_hash_layers}")
+        if num_hash_layers == 0:
+            logger.info("[lwd-edge] tid2eid loading skipped: num_hash_layers=0")
+            return
+        logger.info("[lwd-edge] loading tid2eid tables for %d Hash MoE layers", num_hash_layers)
+        # Reuse vLLM's checkpoint resolution (revision, cache and shard filtering).
+        loader = DefaultModelLoader(self.vllm_config.load_config)
+        _, weight_files, use_safetensors = loader._prepare_weights(
+            self.model_config.model,
+            subfolder=None,
+            revision=self.model_config.revision,
+            fall_back_to_pt=False,
+            allow_patterns_overrides=None,
+        )
+        if not use_safetensors:
+            raise ValueError("LWD DeepSeek V4 tid2eid loading requires safetensors weights")
+        self.tid2eid_tables = load_tid2eid_tables(
+            weight_files, num_hash_layers, config.vocab_size,
+            config.num_experts_per_tok, config.n_routed_experts,
+        )
 
     def _init_worker_distributed_environment(self) -> None:
         """覆写原生入口(worker.py):ascend 侧并行组按 Lwd 布局构建。
@@ -241,6 +274,16 @@ class LwdEdgeWorker(NPUWorker):
         else:
             embeds = model.embed_input_ids(token_ids_tensor)  # (total_N, H)
         _t_fwd = time.monotonic()
+        payload = embeds
+        if self.tid2eid_tables:
+            # The original prompt IDs stay on the edge; transmit only lookups.
+            cpu_ids = torch.tensor(flat_token_ids, dtype=torch.int64)
+            expert_ids = torch.stack([table[cpu_ids] for table in self.tid2eid_tables], dim=1)
+            payload = pack_hash_payload(embeds, expert_ids)
+            logger.info(
+                "[lwd-edge] UP Hash MoE seqno=%d expert_shape=%s payload_numel=%d",
+                seqno, tuple(expert_ids.shape), payload.numel(),
+            )
 
         # aux 帧(mrope positions):pdmix 混批下 has_mrope 是逐请求
         # 列表——仅标记请求贡献行,按 req_ids 序拼接(云侧注入按同序
@@ -274,8 +317,8 @@ class LwdEdgeWorker(NPUWorker):
         request = LwdCommRequest(
             channel=LwdChannelType.UP,
             op="send",
-            num_elements=embeds.numel(),                     # total_N * H
-            tensor=embeds,
+            num_elements=payload.numel(),
+            tensor=payload,
             seqno=seqno,
             aux_tensor=aux_tensor,
             aux_num_elements=(

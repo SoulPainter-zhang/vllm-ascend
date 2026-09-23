@@ -113,6 +113,8 @@ class AscendMoERunner(MoERunner):
         This delegates to the layer's forward_impl method which contains the
         Ascend-specific MoE computation logic.
         """
+        # 在算子运行时更新当前哈希层号，避免依赖模型前向中未被编译保留的属性赋值。
+        get_forward_context().lwd_hash_layer_idx = getattr(self, "lwd_hash_layer_idx", None)
         if self.shared_experts is None:
             result = layer.forward_impl(hidden_states, router_logits)
             # If the layer has shared experts, forward_impl returns a tuple (shared_out, routed_out)

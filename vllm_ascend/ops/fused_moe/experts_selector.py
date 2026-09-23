@@ -22,11 +22,13 @@ from vllm.distributed import get_tp_group
 from vllm.forward_context import get_forward_context
 
 from vllm_ascend.ascend_forward_context import MoECommType
+
 # NOTE: DeviceOperator is imported lazily inside the function below to avoid
 # a circular import: device_op -> vllm_ascend.ops(__init__) -> fused_moe ->
 # experts_selector -> device_op (partially initialized).
 from vllm_ascend.distributed.utils import split_tensor_along_first_dim
 from vllm_ascend.utils import get_weight_prefetch_method
+from vllm_ascend.worker.lwd_hash.lwd_hash_routing import merge_hash_expert_ids
 
 
 def select_experts(
@@ -254,9 +256,22 @@ def _select_experts_with_fusion_ops(
     if scoring_func == "sqrtsoftplus":
         if tid2eid is not None:
             forward_context = get_forward_context()
-            input_ids = forward_context.input_ids.to(torch.int64)
-            # tid2eid_ones = torch.ones(tid2eid.shape[0],tid2eid.shape[1],device=router_logits.device,dtype=torch.int32)
-            tid2eid_ones = tid2eid.to(torch.int32)
+            remote_ids = getattr(forward_context, "lwd_hash_expert_ids", None)
+            if remote_ids is not None:
+                layer_idx = forward_context.lwd_hash_layer_idx
+                tid2eid_ones = merge_hash_expert_ids(
+                    tid2eid, forward_context.input_ids, remote_ids[:, layer_idx],
+                    forward_context.lwd_hash_prompt_mask,
+                )
+                # Treat batch-row indices as IDs into the per-step expert table.
+                # Reuse exactly the native TP/EP row mapping and gating kernel,
+                # preserving sqrtsoftplus weights, scaling and expert ordering.
+                input_ids = torch.arange(remote_ids.shape[0], device=router_logits.device, dtype=torch.int64)
+            else:
+                if forward_context.input_ids is None:
+                    raise ValueError("Hash MoE requires token IDs or LWD expert IDs; prompt routing data is missing")
+                input_ids = forward_context.input_ids.to(torch.int64)
+                tid2eid_ones = tid2eid.to(torch.int32)
             if forward_context.moe_comm_type == MoECommType.ALLGATHER:
                 prepare_finalize = forward_context.moe_comm_method.prepare_finalize
                 input_ids = prepare_finalize.all_gather_input_id_with_dp_group(input_ids)
@@ -270,6 +285,8 @@ def _select_experts_with_fusion_ops(
                 splitted_input = split_tensor_along_first_dim(input_ids, num_partitions=tp_size)
                 input_ids = splitted_input[tp_rank].contiguous()
             input_ids = torch.where(input_ids == -1, 0, input_ids)
+            if remote_ids is not None and input_ids.shape[0] != router_logits.shape[0]:
+                raise ValueError("Hash MoE routing rows do not match router logits after TP/EP splitting")
         else:
             input_ids = None
             tid2eid_ones = None

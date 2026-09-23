@@ -17,7 +17,7 @@ class LwdChannelType(enum.Enum):
     submission order — HCCL does not support tags.
     """
 
-    UP = "lwd_up"      # edge -> cloud: prompt embeddings
+    UP = "lwd_up"      # edge -> cloud: embeddings + optional V4 expert-ID bytes
     DOWN = "lwd_down"  # cloud -> edge: combined c2e packet
 
 
@@ -37,7 +37,8 @@ class LwdCommRequest:
 
     channel: LwdChannelType
     op: Literal["send", "recv"]
-    # Number of bf16 elements of the payload (UP: N*H; DOWN:
+    # Number of bf16 elements of the payload (UP: N*H, or N*(H+4*L*K)
+    # for V4 with L Hash layers and K experts per token; DOWN:
     # 32 + R*(H+3K)).  recv: used to allocate the exact-size buffer
     # (HCCL P2P requires matching numel on both ends).
     num_elements: int

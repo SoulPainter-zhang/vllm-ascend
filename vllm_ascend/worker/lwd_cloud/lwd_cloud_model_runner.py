@@ -17,9 +17,20 @@ import time
 
 import numpy as np
 import torch
+from vllm.distributed.parallel_state import get_pp_group, get_tp_group
+from vllm.forward_context import get_forward_context
 from vllm.logger import logger
+from vllm.v1.outputs import ModelRunnerOutput
 
 from vllm_ascend import envs
+from vllm_ascend.worker.lwd_cloud.lwd_draft_cache import LwdDraftCache
+from vllm_ascend.worker.lwd_cloud.lwd_mtp_proposer import LwdMTPProposer
+from vllm_ascend.worker.lwd_hash.lwd_hash_routing import (
+    LwdHashRoutingState,
+    hash_layer_count,
+    hash_payload_numel,
+    unpack_hash_payload,
+)
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 
@@ -30,6 +41,104 @@ class LwdCloudModelRunner(NPUModelRunner):
         super().__init__(vllm_config, device)
         self.worker = worker  # LwdCloudWorker ref (UP recv futures live there)
         self._lwd_pending_down_payload = None
+        self._lwd_draft_cache = (
+            LwdDraftCache()
+            if self.use_async_scheduling and self.speculative_config is not None
+            and self.speculative_config.method == "mtp"
+            and self.pcp_size == 1 and self.dcp_size == 1 else None
+        )
+        # Stage per-request prompt lengths for device-side mask refresh.
+        if self.use_async_spec_decode and self.enable_prompt_embeds:
+            self._lwd_prompt_lens_gpu = torch.zeros(
+                self.max_num_reqs, dtype=torch.int32, device=self.device
+            )
+        else:
+            self._lwd_prompt_lens_gpu = None
+        self.lwd_hash_state = None
+        # 用空值表示尚未准备真实批次，区分 dummy 前向。
+        self._lwd_hash_step_tokens = None
+        config = self.model_config.hf_config
+        num_hash_layers = hash_layer_count(config)
+        lwd_config = getattr(vllm_config, "lwd_config", None)
+        if num_hash_layers and lwd_config is not None and lwd_config.enabled and lwd_config.mode == "prefill_only":
+            # UP currently broadcasts one edge's batch to one cloud TP group.
+            # CP/DP need additional request-to-rank layouts before supporting V4.
+            parallel = vllm_config.parallel_config
+            if (parallel.data_parallel_size != 1 or parallel.prefill_context_parallel_size != 1
+                    or parallel.decode_context_parallel_size != 1):
+                raise ValueError("LWD V4 Hash routing currently requires DP=PCP=DCP=1 (TP/EP are supported)")
+            self.lwd_hash_state = LwdHashRoutingState(
+                num_hash_layers, config.num_experts_per_tok, config.n_routed_experts,
+            )
+            # Persistent buffers are populated before model execution, so graph
+            # capture and replay see the same addresses for prompt and decode.
+            self._lwd_hash_experts = torch.zeros(
+                self.max_num_tokens, num_hash_layers, config.num_experts_per_tok,
+                dtype=torch.int32, device=device,
+            )
+            self._lwd_hash_prompt_mask = torch.zeros(self.max_num_tokens, dtype=torch.bool, device=device)
+            self._lwd_hash_token_ids = torch.zeros(self.max_num_tokens, dtype=torch.int64, device=device)
+
+    def _update_states(self, scheduler_output):
+        # Called inside synchronize_input_prep(), before remove_request()
+        # destroys the previous mapping and before any new graph replay.
+        if self._lwd_draft_cache is not None:
+            self._lwd_draft_cache.preserve(
+                scheduler_output, self.requests,
+                self.input_batch.prev_req_id_to_index, self._draft_token_ids,
+            )
+        return super()._update_states(scheduler_output)
+
+    def _prepare_input_ids(self, scheduler_output, num_reqs,
+                           total_num_scheduled_tokens, cu_num_tokens):
+        super()._prepare_input_ids(
+            scheduler_output, num_reqs, total_num_scheduled_tokens, cu_num_tokens,
+        )
+        self._lwd_restore_drafts(scheduler_output, num_reqs, cu_num_tokens)
+
+    def _lwd_restore_drafts(self, scheduler_output, num_reqs, cu_num_tokens):
+        cache = self._lwd_draft_cache
+        if cache is None or not cache.entries:
+            return
+        rows, indices = [], []
+        for idx, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+            if req_id not in cache.entries:
+                continue
+            tokens = scheduler_output.scheduled_spec_decode_tokens.get(req_id, ())
+            row = cache.take(req_id, self.requests[req_id], len(tokens))
+            # Consume the generation even when the scheduler drops all drafts.
+            if not tokens or self.prev_positions.np[idx] >= 0:
+                continue
+            if row is None:
+                raise RuntimeError(f"LWD draft snapshot is invalid for {req_id}")
+            end = int(cu_num_tokens[idx])
+            begin = int(cu_num_tokens[idx - 1]) if idx else 0
+            if end - begin < len(tokens) + 1:
+                raise RuntimeError(f"LWD draft segment is too short for {req_id}")
+            rows.append(row)
+            indices.extend(range(end - len(tokens), end))
+        if rows:
+            # Same stream as native input assembly and subsequent metadata /
+            # embedding construction. No device-to-host copy or host wait.
+            dst = torch.tensor(indices, dtype=torch.int64, pin_memory=self.pin_memory).to(
+                self.device, non_blocking=True,
+            )
+            self.input_ids.gpu.scatter_(
+                0, dst, torch.cat(rows).to(dtype=self.input_ids.gpu.dtype),
+            )
+
+    def _get_drafter(self):
+        """Use the LWD MTP embedding adapter only in prefill_only mode."""
+        lwd_config = getattr(self.vllm_config, "lwd_config", None)
+        if (
+            lwd_config is not None
+            and lwd_config.enabled
+            and lwd_config.mode == "prefill_only"
+            and self.speculative_config.method == "mtp"
+            and not self.speculative_config.use_step3p5_mtp()
+        ):
+            return LwdMTPProposer(self.vllm_config, self.device, self)
+        return super()._get_drafter()
 
     # ------------------------------------------------------------------ #
     # Remote embeds injection (cloud input has NO token ids — the prompt   #
@@ -60,7 +169,34 @@ class LwdCloudModelRunner(NPUModelRunner):
             self._lwd_rebuild_is_token_ids_mask(num_scheduled_tokens)
             self._lwd_release_consumed_prompt_embeds()
             self._lwd_inject_remote_embeds(harvested, num_scheduled_tokens)
+        if self.lwd_hash_state is not None:
+            self._lwd_prepare_hash_batch(num_scheduled_tokens)
         return out
+
+    def _lwd_prepare_hash_batch(self, num_scheduled_tokens):
+        """Skip remote expert staging for decode, preserving graph buffers."""
+        num_reqs = self.input_batch.num_reqs
+        counts = num_scheduled_tokens[:num_reqs]
+        computed = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+        prompt_lengths = self.input_batch.num_prompt_tokens[:num_reqs]
+        self._lwd_hash_step_tokens = sum(int(n) for n in counts)
+        has_prompt = any(
+            int(count) > 0 and int(start) < int(prompt_len)
+            for count, start, prompt_len in zip(counts, computed, prompt_lengths)
+        )
+        # Clear the full mask, including graph padding and previous larger
+        # batches. Keep its address and the captured merge graph unchanged.
+        self._lwd_hash_prompt_mask.zero_()
+        if not has_prompt:
+            # The merge selects local lookup for every row. Stale expert IDs
+            # are only unselected values, never indices into an expert table.
+            return
+        batch, mask = self.lwd_hash_state.build_batch(
+            self.input_batch.req_ids, counts, computed, prompt_lengths,
+        )
+        self._lwd_hash_experts.zero_()
+        self._lwd_hash_experts[:batch.shape[0]].copy_(batch)
+        self._lwd_hash_prompt_mask[:mask.shape[0]].copy_(mask)
 
     def _lwd_rebuild_is_token_ids_mask(self, num_scheduled_tokens) -> None:
         """重建 prompt-embeds 分支的扁平 is_token_ids 掩码。
@@ -78,8 +214,9 @@ class LwdCloudModelRunner(NPUModelRunner):
         LWD 语义里只有注入行(prompt 段)应是 embeds 行(False),
         decode/草稿行恒为 token id(True)。此处按调度状态确定性重建,
         不依赖任何乐观值修正:decode 请求的 computed 乐观只会偏大,
-        prefill_rows 恒为 0,天然安全。GPU 侧掩码全仓只写不读,只需
-        修 CPU 视图(.np 与 .cpu 同存储)。
+        prefill_rows 恒为 0,天然安全。保留 CPU 视图修复供父类路径使用
+        (.np 与 .cpu 同存储)；异步路径在 _preprocess 中按修正后的
+        设备位置重新生成 GPU 掩码，并直接消费设备 embedding。
         """
         if not self.input_batch.req_prompt_embeds:
             # 批内无 embeds 缓冲(MM/text 分支,掩码无人读)
@@ -99,6 +236,109 @@ class LwdCloudModelRunner(NPUModelRunner):
             if prefill_rows > 0:
                 mask[off : off + prefill_rows] = False
             off += n
+
+    def _preprocess(self, scheduler_output, num_input_tokens, intermediate_tensors=None):
+        """在异步投机位置修正后刷新 decode 掩码，再准备模型输入。"""
+        if (self.use_async_spec_decode and self.enable_prompt_embeds
+                and intermediate_tensors is None and self.pcp_size == 1):
+            self._lwd_refresh_decode_embedding_mask(scheduler_output)
+            if (get_pp_group().is_first_rank
+                    and not self.model_config.is_encoder_decoder
+                    and (not self.supports_mm_inputs or self.input_batch.req_prompt_embeds)):
+                return self._lwd_preprocess_prompt_embeds(scheduler_output, num_input_tokens)
+            # Other model paths keep the parent's preprocessing, which may
+            # still consume the CPU mask (for example encoder-decoder models).
+            count = scheduler_output.total_num_scheduled_tokens
+            self.is_token_ids.np[:count] = self.is_token_ids.gpu[:count].cpu().numpy()
+        return super()._preprocess(scheduler_output, num_input_tokens, intermediate_tensors)
+
+    def _lwd_preprocess_prompt_embeds(self, scheduler_output, num_input_tokens):
+        """Consume the corrected device mask on the LWD cloud decoder path."""
+        count = scheduler_output.total_num_scheduled_tokens
+        is_token_ids = self.is_token_ids.gpu[:count]
+        # Remote prompt rows do not carry meaningful token IDs.
+        token_ids = self.input_ids.gpu[:count].masked_fill(~is_token_ids, 0)
+        tokens_to_embeds = self.model.embed_input_ids(input_ids=token_ids)
+        embeds = self.inputs_embeds.gpu[:count]
+        embeds.copy_(torch.where(is_token_ids.unsqueeze(-1), tokens_to_embeds, embeds))
+
+        # Match the parent's position layout and clear padding for graph replay.
+        if self.uses_mrope:
+            positions = self.mrope_positions.gpu[:, :num_input_tokens]
+        elif self.uses_xdrope_dim > 0:
+            positions = self.xdrope_positions.gpu[:, :num_input_tokens]
+        else:
+            positions = self.positions[:num_input_tokens]
+            if num_input_tokens > count:
+                self.positions[count:num_input_tokens].zero_()
+        return (
+            None,
+            self.inputs_embeds.gpu[:num_input_tokens],
+            positions,
+            None,
+            self._init_model_kwargs(),
+            None,
+        )
+
+    def _lwd_refresh_decode_embedding_mask(self, scheduler_output):
+        """根据设备上的实际位置重建掩码，避免 decode 行复用旧 embedding。
+
+        异步上传各请求的 prompt 长度，复用设备上的请求索引展开到 token 行。
+        掩码直接写入设备缓冲区，由 LWD prompt-embeds 路径在设备上消费；
+        不回传 positions，也不刷新 CPU 掩码。
+        """
+        num_reqs = len(self.input_batch.req_ids)
+        count = scheduler_output.total_num_scheduled_tokens
+        prompt_lens_gpu = self._lwd_prompt_lens_gpu
+        assert prompt_lens_gpu is not None
+        prompt_lens_gpu[:num_reqs].copy_(
+            self.input_batch.num_prompt_tokens_cpu_tensor[:num_reqs],
+            non_blocking=True,
+        )
+        prompt_lens_rows = prompt_lens_gpu[self.req_indices.gpu[:count]]
+        self.is_token_ids.gpu[:count] = self.positions[:count] >= prompt_lens_rows
+
+    # 在云侧模拟前向前清除真实批次标记，防止复用上次请求路由。
+    def _dummy_run(self, *args, **kwargs):
+        """清除真实批次的 Hash 路由标记，再执行模拟前向。"""
+        # 用空值表示尚未准备真实批次，区分 dummy 前向。
+        self._lwd_hash_step_tokens = None
+        return super()._dummy_run(*args, **kwargs)
+
+    def _model_forward(self, num_tokens_padded, input_ids=None, positions=None,
+                       intermediate_tensors=None, inputs_embeds=None, **model_kwargs):
+        """按 SP 布局切分 embedding，并将完整 Hash 路由数据写入前向上下文。"""
+        context = get_forward_context()
+        if (inputs_embeds is not None and intermediate_tensors is None
+                and context.flash_comm_v1_enabled and not self.supports_mm_inputs):
+            # 直接传入 embedding 会绕过原生嵌入层，需要在此补上序列切分。
+            tp_group = get_tp_group()
+            if tp_group.world_size > 1:
+                if inputs_embeds.shape[0] != num_tokens_padded:
+                    raise ValueError("LWD SP expects full-token inputs_embeds before slicing")
+                if context.pad_size:
+                    inputs_embeds = torch.nn.functional.pad(inputs_embeds, (0, 0, 0, context.pad_size))
+                inputs_embeds = inputs_embeds.chunk(tp_group.world_size, dim=0)[tp_group.rank_in_group]
+            # 位置、注意力元数据和 Hash 路由表保持完整 token 布局。
+        if self.lwd_hash_state is not None:
+            # 先初始化路由索引缓存，确保补齐行使用合法零索引。
+            self._lwd_hash_token_ids.zero_()
+            if self._lwd_hash_step_tokens is None:
+                # Synthetic forwards have no remote prompt; route dummy token 0.
+                self._lwd_hash_prompt_mask.zero_()
+            else:
+                count = self._lwd_hash_step_tokens
+                if count > num_tokens_padded:
+                    raise ValueError("LWD Hash routing rows exceed model input rows")
+                # Native input preparation retains real decode IDs even when
+                # model input_ids=None because the model consumes embeddings.
+                self._lwd_hash_token_ids[:count].copy_(self.input_ids.gpu[:count])
+            context.input_ids = self._lwd_hash_token_ids[:num_tokens_padded]
+            context.lwd_hash_expert_ids = self._lwd_hash_experts[:num_tokens_padded]
+            context.lwd_hash_prompt_mask = self._lwd_hash_prompt_mask[:num_tokens_padded]
+        return super()._model_forward(
+            num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs,
+        )
 
     def _lwd_enabled(self) -> bool:
         cfg = getattr(self.vllm_config, "lwd_config", None)
@@ -120,6 +360,11 @@ class LwdCloudModelRunner(NPUModelRunner):
         the flush hook never fires): a stale buffer at a recycled index
         would otherwise be mistaken for the new occupant's embeds.
         """
+        if self.lwd_hash_state is not None:
+            for req_id in list(self.lwd_hash_state.requests):
+                request = self.requests.get(req_id)
+                if request is None or request.num_computed_tokens >= request.num_prompt_tokens:
+                    self.lwd_hash_state.discard(req_id)
         embeds_map = self.input_batch.req_prompt_embeds
         if not embeds_map:
             return
@@ -174,7 +419,15 @@ class LwdCloudModelRunner(NPUModelRunner):
                 continue
             future, meta = item
             _t_wait = time.monotonic()
-            numel = sum(len(t) for t in meta.token_ids) * hidden_size
+            num_tokens = sum(len(t) for t in meta.token_ids)
+            config = self.model_config.hf_config
+            numel = hash_payload_numel(
+                num_tokens, hidden_size, hash_layer_count(config),
+                getattr(config, "num_experts_per_tok", 0),
+            )
+            if not (len(meta.req_ids) == len(meta.token_ids)
+                    == len(meta.prompt_offsets) == len(meta.has_mrope)):
+                raise ValueError("LWD requires one prompt offset and mrope flag per request")
             aux_numel = (
                 sum(
                     len(t)
@@ -235,7 +488,7 @@ class LwdCloudModelRunner(NPUModelRunner):
             logger.info(
                 "[Lwd][cloud-runner] UP embeds harvested seqno=%s rows=%d "
                 "reqs=%s mrope_rows=%s",
-                batch_seqno, numel // hidden_size, meta.req_ids,
+                batch_seqno, num_tokens, meta.req_ids,
                 mrope_flat.shape[0] if mrope_flat is not None else 0,
             )
             # 窗口核验 + mrope 行写入(当步生效的前提:super() 内的
@@ -273,11 +526,18 @@ class LwdCloudModelRunner(NPUModelRunner):
                             f"{int(computed[idx])} prompt="
                             f"{int(num_prompt[idx])})"
                         )
+                    start = int(meta.prompt_offsets[k])
+                    prompt_len = int(num_prompt[idx])
+                    if start != int(computed[idx]) or not 0 <= start <= start + n <= prompt_len:
+                        raise ValueError(
+                            f"LWD prompt chunk offset mismatch for {req_id}: "
+                            f"start={start}, computed={int(computed[idx])}, rows={n}, prompt={prompt_len}"
+                        )
                     if meta.has_mrope[k]:
                         # mrope 行与 embeds 行同窗(边侧同批切片);aux
                         # 帧只含标记请求,游标独立推进
                         self._lwd_inject_mrope_positions(
-                            req_id, int(computed[idx]), n,
+                            req_id, start, n,
                             mrope_flat[mrope_row : mrope_row + n],
                             int(num_prompt[idx]),
                         )
@@ -306,7 +566,6 @@ class LwdCloudModelRunner(NPUModelRunner):
             return
         embeds_map = self.input_batch.req_prompt_embeds
         num_prompt = self.input_batch.num_prompt_tokens
-        computed = self.input_batch.num_computed_tokens_cpu
         hidden_size = self.model_config.get_hidden_size()
         gpu_embeds = self.inputs_embeds.gpu
 
@@ -319,14 +578,24 @@ class LwdCloudModelRunner(NPUModelRunner):
             off += int(num_scheduled_tokens[i]) if i < len(num_scheduled_tokens) else 0
 
         for batch_seqno, meta, up_flat in harvested:
-            embeds = up_flat.view(-1, hidden_size)
+            num_tokens = sum(len(t) for t in meta.token_ids)
+            config = self.model_config.hf_config
+            num_hash_layers = hash_layer_count(config)
+            expert_ids = None
+            if num_hash_layers:
+                embeds, expert_ids = unpack_hash_payload(
+                    up_flat, num_tokens, hidden_size, num_hash_layers,
+                    config.num_experts_per_tok,
+                )
+            else:
+                embeds = up_flat.view(num_tokens, hidden_size)
             logger.info(
                 "[Lwd][cloud-runner] UP embeds injected seqno=%s rows=%s "
                 "reqs=%s",
                 batch_seqno, embeds.shape[0], meta.req_ids,
             )
             row = 0
-            for req_id, token_ids in zip(meta.req_ids, meta.token_ids):
+            for meta_idx, (req_id, token_ids) in enumerate(zip(meta.req_ids, meta.token_ids)):
                 n = len(token_ids)
                 idx = self.input_batch.req_id_to_index.get(req_id)
                 if idx is None:
@@ -337,7 +606,13 @@ class LwdCloudModelRunner(NPUModelRunner):
                         f"(batch={self.input_batch.req_ids})"
                     )
                 if n > 0:
-                    start = int(computed[idx])
+                    start = int(meta.prompt_offsets[meta_idx])
+                    if self.lwd_hash_state is not None:
+                        if expert_ids is None:
+                            raise ValueError(f"Missing LWD V4 expert payload for {req_id}")
+                        self.lwd_hash_state.add_chunk(
+                            req_id, int(num_prompt[idx]), start, expert_ids[row:row + n],
+                        )
                     out = out_offset.get(req_id, 0)
                     # stream 上直接写 inputs_embeds.gpu 的调度窗口
                     gpu_embeds[out : out + n].copy_(
@@ -641,4 +916,3 @@ class LwdCloudModelRunner(NPUModelRunner):
         stage.numpy()[:n] = arr
         dev[:n].copy_(stage[:n], non_blocking=True)
         return dev[:n]
-
