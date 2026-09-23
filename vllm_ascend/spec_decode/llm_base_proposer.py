@@ -1402,9 +1402,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         draft model does not consume ``inputs_embeds``, or a CP (pcp)
         manager rewrites first-pass inputs (different layout).
         """
-        provider = self._lwd_prompt_embeds_provider
         runner = self.runner
-        if provider is None or runner is None:
+        if runner is None:
             return None
         # The draft model must actually consume inputs_embeds (checked
         # once); otherwise the token-id path stays authoritative.
@@ -1455,13 +1454,15 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             base = int(computed[i]) if i < len(computed) else 0
             prompt_len = int(num_prompt[i]) if i < len(num_prompt) else 0
             if base + 1 >= prompt_len:
-                # 段内无 prompt 行(decode 请求):打底已正确,不查 provider
+                # 段内无 prompt 行(decode 请求):打底已正确,跳过
                 continue
-            prompt_embeds = provider(req_id)  # [prompt_len, H] or None
-            if prompt_embeds is None or prompt_embeds.shape[0] < base + seg_len:
-                return None  # chunk rows not fully assembled -> token-id path
-            # positions s..e-2 hold prompt tokens base+1..base+seg_len-1
-            out[s: e - 1] = prompt_embeds[base + 1: base + seg_len]
+            # 直读主模型 inputs_embeds.gpu(替代 CPU 装配缓冲):
+            # 注入期该窗口已写入权威 embeds,与装配缓冲逐位同源
+            # (缓冲本就从这张量 D2H 出去)。窗口映射:调度段 [s,e) 的
+            # 行 = prompt 位置 [base, base+seg_len),provider 需要
+            # [base+1, base+seg_len) ⇒ gpu[s+1:e]。消除每 chunk
+            # 84MB 的 D2H 同步长尾(实测占 inject 段大头)。
+            out[s : e - 1] = runner.inputs_embeds.gpu[s + 1 : e]
             wrote_any = True
         if not wrote_any:
             return None

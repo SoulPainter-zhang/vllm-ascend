@@ -164,7 +164,22 @@ class LwdCloudModelRunner(NPUModelRunner):
         harvested = None
         if self._lwd_enabled():
             harvested = self._lwd_harvest_up_batches(num_scheduled_tokens)
-        out = super()._prepare_inputs(scheduler_output, num_scheduled_tokens)
+        embeds_map = None
+        if self._lwd_enabled():
+            # 跳过基类填充循环对 LWD 占位行的逐行拷贝(gpu_model_runner
+            # .py:952-996):该循环把 CPU 装配缓冲的当步窗口(此刻恒为
+            # 零值)做 84MB 主机 memcpy + H2D 灌入 inputs_embeds,随后
+            # 注入覆写同一窗口(后写为权威)——纯浪费,实测 super 段
+            # ~17-20ms/chunk。清空映射即整体跳过;注入/释放逻辑在
+            # super() 返回后恢复引用。LWD 云侧请求全是占位行,无真实
+            # prompt-embeds 消费者被误伤。
+            embeds_map = self.input_batch.req_prompt_embeds
+            self.input_batch.req_prompt_embeds = {}
+        try:
+            out = super()._prepare_inputs(scheduler_output, num_scheduled_tokens)
+        finally:
+            if embeds_map is not None:
+                self.input_batch.req_prompt_embeds = embeds_map
         if self._lwd_enabled():
             self._lwd_rebuild_is_token_ids_mask(num_scheduled_tokens)
             self._lwd_release_consumed_prompt_embeds()
@@ -556,15 +571,14 @@ class LwdCloudModelRunner(NPUModelRunner):
         The flattened output offsets reproduce the native fill loop's
         accumulation (per-request scheduled segment start), so rows land
         exactly where the prompt-embeds branch expects them.  The CPU
-        assembly buffer is also filled via an on-stream D2H copy — its
-        only downstream consumer (draft first-pass provider) reads it
-        with stream-ordered H2D copies, so no host sync is needed there
-        either.  The base fill loop may have copied stale buffer content
-        earlier; our device write happens after it and is authoritative.
+        draft first-pass provider reads the SAME window straight from
+        ``inputs_embeds.gpu`` (llm_base_proposer), so the CPU assembly
+        buffer is no longer written at all — the per-chunk 84MB D2H is
+        gone.  The base fill loop is skipped for LWD placeholder rows
+        (see ``_prepare_inputs``); our device write is authoritative.
         """
         if not harvested:
             return
-        embeds_map = self.input_batch.req_prompt_embeds
         num_prompt = self.input_batch.num_prompt_tokens
         hidden_size = self.model_config.get_hidden_size()
         gpu_embeds = self.inputs_embeds.gpu
@@ -618,13 +632,9 @@ class LwdCloudModelRunner(NPUModelRunner):
                     gpu_embeds[out : out + n].copy_(
                         embeds[row : row + n], non_blocking=True
                     )
-                    # CPU 组装缓冲同 stream D2H(供 draft provider 用)
-                    prompt_len = int(num_prompt[idx])
-                    buf = embeds_map.get(idx)
-                    if buf is not None and buf.shape[0] == prompt_len:
-                        buf[start : start + n].copy_(
-                            embeds[row : row + n], non_blocking=True
-                        )
+                    # 不再 D2H 写 CPU 装配缓冲:draft provider 已改为
+                    # 直读 inputs_embeds.gpu 同窗口(本行即权威副本),
+                    # 消除每 chunk 84MB 的 D2H 同步长尾
                     self.input_batch.is_token_ids[idx, start : start + n] = False
                 row += n
             # 跨流生命周期登记:端点 recv buffer 由通道流分配与复用
