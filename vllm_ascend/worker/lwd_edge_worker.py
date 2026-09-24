@@ -38,6 +38,9 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheSpec
 
 
+# mm_hash 编码缓存容量(条目数;1080p 单条约 26MB HBM)
+_LWD_MM_HASH_CACHE_MAX_ITEMS = 32
+
 # ---- token recovery / logit-rank lookup ----
 def select_token_batch(
     logits: torch.Tensor, ranks: list[int]
@@ -133,14 +136,14 @@ class LwdEdgeWorker(NPUWorker):
         super().init_device()
         self.comm_service = get_lwd_comm_service()
         # 多模态缓存:req_id -> mm_features(带 data,首 chunk 随
-        # scheduled_new_reqs 到达时登记;位置信息按请求);
-        # 视觉塔输出按 mm_hash(内容哈希)键共享缓存 + 引用计数,
-        # 与集中式 encoder cache 同粒度——同图复用不重编;chunk 窗口
-        # 越过全部 mm 段或 finished_req_ids 时按引用计数释放。
+        # scheduled_new_reqs 到达时登记,chunk 越过全部 mm 段或
+        # finished_req_ids 时摘除;位置信息按请求);
+        # 视觉塔输出按 mm_hash(内容哈希)键共享缓存,与集中式
+        # encoder cache 同粒度——同图复用不重编;容量淘汰(FIFO),
+        # 不随请求生命周期释放(首版引用计数方案在错峰首 chunk 下
+        # 会在后继请求到达前误删共享条目,实测同图 30 并发仍全价编码)。
         self._lwd_mm_features_dict: dict[str, list] = {}
         self._lwd_mm_hash_embeds: dict[str, object] = {}
-        self._lwd_mm_hash_refs: dict[str, list[str]] = {}
-        self._lwd_mm_hash_refcount: dict[str, int] = {}
 
         from vllm_ascend.distributed import lwd_wire
         lwd_wire.init_lwd_duplex_channels()
@@ -358,14 +361,6 @@ class LwdEdgeWorker(NPUWorker):
         features = self._lwd_mm_features_dict.get(req_id)
         if not features:
             return []
-        # 引用登记(每请求一次):该请求引用的 hash 集合,完结时释放
-        if req_id not in self._lwd_mm_hash_refs:
-            refs = [f.identifier for f in features]
-            self._lwd_mm_hash_refs[req_id] = refs
-            for identifier in refs:
-                self._lwd_mm_hash_refcount[identifier] = (
-                    self._lwd_mm_hash_refcount.get(identifier, 0) + 1
-                )
         missing_features = [
             f for f in features if f.identifier not in self._lwd_mm_hash_embeds
         ]
@@ -400,6 +395,11 @@ class LwdEdgeWorker(NPUWorker):
                 self._lwd_mm_hash_embeds[feature.identifier] = (
                     outputs_by_modality[feature.modality].pop(0)
                 )
+            # 容量淘汰(FIFO):超容量摘最旧条目,被淘汰顶多重编一次
+            while len(self._lwd_mm_hash_embeds) > _LWD_MM_HASH_CACHE_MAX_ITEMS:
+                self._lwd_mm_hash_embeds.pop(
+                    next(iter(self._lwd_mm_hash_embeds))
+                )
             # [Lwd][perf] 视觉塔耗时(仅缓存未命中计次;同图复用不重编)
             logger.info(
                 "[Lwd][perf] mm-encoder req=%s items=%d dur=%.2fms",
@@ -412,19 +412,9 @@ class LwdEdgeWorker(NPUWorker):
         ]
 
     def _lwd_mm_release_request(self, req_id: str) -> None:
-        """按请求释放 mm 缓存:位置特征随请求摘除;hash 编码结果按
-        引用计数递减,归零才释放(同图其他请求仍在用时保留)。"""
+        """按请求释放 mm 位置特征;hash 编码结果不随请求释放
+        (容量淘汰,见 _lwd_mm_encoder_outputs)。"""
         self._lwd_mm_features_dict.pop(req_id, None)
-        refs = self._lwd_mm_hash_refs.pop(req_id, None)
-        if not refs:
-            return
-        for identifier in refs:
-            count = self._lwd_mm_hash_refcount.get(identifier, 0) - 1
-            if count <= 0:
-                self._lwd_mm_hash_refcount.pop(identifier, None)
-                self._lwd_mm_hash_embeds.pop(identifier, None)
-            else:
-                self._lwd_mm_hash_refcount[identifier] = count
 
     def _lwd_gather_chunk_mm(self, batch_meta: LwdEmbedBatch):
         """按本 chunk 窗口收集 mm embeds 行 + 构造 is_multimodal 掩码。
