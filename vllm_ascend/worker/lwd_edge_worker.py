@@ -132,12 +132,15 @@ class LwdEdgeWorker(NPUWorker):
         # order, which only holds once every rank is past its distributed init.
         super().init_device()
         self.comm_service = get_lwd_comm_service()
-        # 多模态请求级缓存:req_id -> mm_features(带 data,首 chunk 随
-        # scheduled_new_reqs 到达时登记) / req_id -> [(mm_position,
-        # encoder_embeds)](视觉塔输出,首用即算)。chunk 窗口越过全部
-        # mm 段后摘除(见 _execute_lwd_embed),finished_req_ids 兜底。
+        # 多模态缓存:req_id -> mm_features(带 data,首 chunk 随
+        # scheduled_new_reqs 到达时登记;位置信息按请求);
+        # 视觉塔输出按 mm_hash(内容哈希)键共享缓存 + 引用计数,
+        # 与集中式 encoder cache 同粒度——同图复用不重编;chunk 窗口
+        # 越过全部 mm 段或 finished_req_ids 时按引用计数释放。
         self._lwd_mm_features_dict: dict[str, list] = {}
-        self._lwd_mm_embeds_dict: dict[str, list] = {}
+        self._lwd_mm_hash_embeds: dict[str, object] = {}
+        self._lwd_mm_hash_refs: dict[str, list[str]] = {}
+        self._lwd_mm_hash_refcount: dict[str, int] = {}
 
         from vllm_ascend.distributed import lwd_wire
         lwd_wire.init_lwd_duplex_channels()
@@ -167,8 +170,7 @@ class LwdEdgeWorker(NPUWorker):
         # mm 窗口后已提前摘除,此为兜底)。
         if scheduler_output.finished_req_ids:
             for req_id in scheduler_output.finished_req_ids:
-                self._lwd_mm_features_dict.pop(req_id, None)
-                self._lwd_mm_embeds_dict.pop(req_id, None)
+                self._lwd_mm_release_request(req_id)
         if lwd_batch is None:
             logger.debug("[lwd-edge] step carries no LWD batch; nothing to do")
             return None
@@ -344,54 +346,85 @@ class LwdEdgeWorker(NPUWorker):
     # ------------------------------------------------------------------ #
 
     def _lwd_mm_encoder_outputs(self, req_id: str) -> list:
-        """视觉塔输出(请求级惰性计算+缓存):[(mm_position, embeds)]。
+        """视觉塔输出(请求级惰性计算 + mm_hash 键共享缓存):
+        [(mm_position, embeds)]。
 
-        embeds 按 mm_hash 语义本应跨请求共享,这里按请求缓存(单请求
-        组批下重复图极少);输出常驻至该请求 chunk 流越过全部 mm 窗口。"""
-        cached = self._lwd_mm_embeds_dict.get(req_id)
-        if cached is not None:
-            return cached
-        _t_enc = time.monotonic()
+        编码结果按内容哈希(mm_hash/identifier)跨请求共享——与集中式
+        encoder cache 同粒度,同图复用不重编(此前按 req_id 缓存,
+        重复图每请求全价编码);位置信息(mm_position)仍按请求取,
+        只有编码结果共享。引用计数随请求生命周期释放:
+        _lwd_mm_release_request 在 chunk 越过全部 mm 段或
+        finished_req_ids 兜底时按请求摘除其引用的 hash。"""
         features = self._lwd_mm_features_dict.get(req_id)
         if not features:
             return []
-        missing = [f.identifier for f in features if f.data is None]
-        if missing:
-            # data 缺失即无法计算图像 embeds——静默跳过 = 图像 token 按
-            # 文本嵌入错算,fail-fast。
-            raise RuntimeError(
-                f"[Lwd] mm feature data missing for req={req_id} "
-                f"(mm_hashes={missing}): cannot compute image embeddings; "
-                "check mm processor/receiver cache chain"
-            )
-        model = self.model_runner.get_model()
-        from vllm.multimodal.utils import group_and_batch_mm_kwargs
+        # 引用登记(每请求一次):该请求引用的 hash 集合,完结时释放
+        if req_id not in self._lwd_mm_hash_refs:
+            refs = [f.identifier for f in features]
+            self._lwd_mm_hash_refs[req_id] = refs
+            for identifier in refs:
+                self._lwd_mm_hash_refcount[identifier] = (
+                    self._lwd_mm_hash_refcount.get(identifier, 0) + 1
+                )
+        missing_features = [
+            f for f in features if f.identifier not in self._lwd_mm_hash_embeds
+        ]
+        if missing_features:
+            missing = [f.identifier for f in missing_features if f.data is None]
+            if missing:
+                # data 缺失即无法计算图像 embeds——静默跳过 = 图像 token
+                # 按文本嵌入错算,fail-fast。
+                raise RuntimeError(
+                    f"[Lwd] mm feature data missing for req={req_id} "
+                    f"(mm_hashes={missing}): cannot compute image embeddings; "
+                    "check mm processor/receiver cache chain"
+                )
+            _t_enc = time.monotonic()
+            model = self.model_runner.get_model()
+            from vllm.multimodal.utils import group_and_batch_mm_kwargs
 
-        mm_kwargs = [(f.modality, f.data) for f in features]
-        outputs_by_modality: dict[str, list] = {}
-        for modality, num_items, mm_kwargs_batch in group_and_batch_mm_kwargs(
-            mm_kwargs,
-            device=self.model_runner.device,
-            pin_memory=getattr(self.model_runner, "pin_memory", False),
-        ):
-            batch_outputs = model.embed_multimodal(**mm_kwargs_batch)
-            assert len(batch_outputs) == num_items, (
-                f"encoder outputs {len(batch_outputs)} != items "
-                f"{num_items} (req={req_id}, modality={modality})"
+            mm_kwargs = [(f.modality, f.data) for f in missing_features]
+            outputs_by_modality: dict[str, list] = {}
+            for modality, num_items, mm_kwargs_batch in group_and_batch_mm_kwargs(
+                mm_kwargs,
+                device=self.model_runner.device,
+                pin_memory=getattr(self.model_runner, "pin_memory", False),
+            ):
+                batch_outputs = model.embed_multimodal(**mm_kwargs_batch)
+                assert len(batch_outputs) == num_items, (
+                    f"encoder outputs {len(batch_outputs)} != items "
+                    f"{num_items} (req={req_id}, modality={modality})"
+                )
+                outputs_by_modality.setdefault(modality, []).extend(batch_outputs)
+            for feature in missing_features:
+                self._lwd_mm_hash_embeds[feature.identifier] = (
+                    outputs_by_modality[feature.modality].pop(0)
+                )
+            # [Lwd][perf] 视觉塔耗时(仅缓存未命中计次;同图复用不重编)
+            logger.info(
+                "[Lwd][perf] mm-encoder req=%s items=%d dur=%.2fms",
+                req_id, len(missing_features),
+                (time.monotonic() - _t_enc) * 1000,
             )
-            outputs_by_modality.setdefault(modality, []).extend(batch_outputs)
-        result = []
-        for feature in features:
-            result.append(
-                (feature.mm_position, outputs_by_modality[feature.modality].pop(0))
-            )
-        self._lwd_mm_embeds_dict[req_id] = result
-        # [Lwd][perf] 视觉塔逐请求耗时(MM 劣化归因:1080p 单卡串行前向)
-        logger.info(
-            "[Lwd][perf] mm-encoder req=%s items=%d dur=%.2fms",
-            req_id, len(result), (time.monotonic() - _t_enc) * 1000,
-        )
-        return result
+        return [
+            (f.mm_position, self._lwd_mm_hash_embeds[f.identifier])
+            for f in features
+        ]
+
+    def _lwd_mm_release_request(self, req_id: str) -> None:
+        """按请求释放 mm 缓存:位置特征随请求摘除;hash 编码结果按
+        引用计数递减,归零才释放(同图其他请求仍在用时保留)。"""
+        self._lwd_mm_features_dict.pop(req_id, None)
+        refs = self._lwd_mm_hash_refs.pop(req_id, None)
+        if not refs:
+            return
+        for identifier in refs:
+            count = self._lwd_mm_hash_refcount.get(identifier, 0) - 1
+            if count <= 0:
+                self._lwd_mm_hash_refcount.pop(identifier, None)
+                self._lwd_mm_hash_embeds.pop(identifier, None)
+            else:
+                self._lwd_mm_hash_refcount[identifier] = count
 
     def _lwd_gather_chunk_mm(self, batch_meta: LwdEmbedBatch):
         """按本 chunk 窗口收集 mm embeds 行 + 构造 is_multimodal 掩码。
@@ -438,8 +471,7 @@ class LwdEdgeWorker(NPUWorker):
                     is_mm[req_start_pos + start_idx : req_start_pos + end_idx] = True
                 mm_embeds.append(rows)
             if cached and p_offset + n >= max_end:
-                self._lwd_mm_features_dict.pop(req_id, None)
-                self._lwd_mm_embeds_dict.pop(req_id, None)
+                self._lwd_mm_release_request(req_id)
             req_start += n
         return mm_embeds, is_mm
 
